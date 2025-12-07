@@ -77,6 +77,7 @@ const PlayerProfileWidget = ({
 }) => {
     const [isSelectorOpen, setSelectorOpen] = useState(false);
 
+    // Don't render if inactive
     if (!profile.isActive) return null;
 
     return (
@@ -170,7 +171,9 @@ export default function App() {
   const [peerId, setPeerId] = useState<string>('');
   const [hostId] = useState(() => new URLSearchParams(window.location.search).get('hostId'));
   const isHost = !hostId;
-  const connectionsRef = useRef<any[]>([]); // For Host
+  
+  // Host stores connections along with the assigned color
+  const connectionsRef = useRef<{ conn: any, color: PlayerColor }[]>([]); 
   const connectionRef = useRef<any>(null); // For Guest
 
   const [myColor, setMyColor] = useState<PlayerColor>(isHost ? PlayerColor.RED : PlayerColor.BLUE);
@@ -202,10 +205,10 @@ export default function App() {
 
   // Player Profiles
   const [playerProfiles, setPlayerProfiles] = useState<Record<PlayerColor, PlayerProfile>>({
-    [PlayerColor.BLUE]: { name: 'Player 1', flag: null, isActive: true, isBot: true },
-    [PlayerColor.RED]: { name: 'Host', flag: null, isActive: true, isBot: false },
-    [PlayerColor.GREEN]: { name: 'Player 3', flag: null, isActive: true, isBot: true },
-    [PlayerColor.YELLOW]: { name: 'Player 4', flag: null, isActive: true, isBot: true },
+    [PlayerColor.BLUE]: { name: 'Waiting...', flag: null, isActive: true, isBot: false },
+    [PlayerColor.RED]: { name: 'Host (You)', flag: null, isActive: true, isBot: false },
+    [PlayerColor.GREEN]: { name: 'Waiting...', flag: null, isActive: true, isBot: false },
+    [PlayerColor.YELLOW]: { name: 'Waiting...', flag: null, isActive: true, isBot: false },
   });
   
   // Sound
@@ -217,7 +220,6 @@ export default function App() {
   // Queue System
   const [isQueueMode, setIsQueueMode] = useState(false); 
   const [queueSpotTaken, setQueueSpotTaken] = useState(false);
-  const [queueEntryTime, setQueueEntryTime] = useState<number | null>(null);
 
   // --- PeerJS Logic ---
   useEffect(() => {
@@ -244,6 +246,8 @@ export default function App() {
              if (typeof data.payload.moveTimer === 'number') setMoveTimer(data.payload.moveTimer);
           } else if (data.type === 'WELCOME') {
              setMyColor(data.color);
+          } else if (data.type === 'ERROR') {
+             alert(data.message);
           }
         });
       }
@@ -251,38 +255,74 @@ export default function App() {
 
     if (isHost) {
       peer.on('connection', (conn: any) => {
-        connectionsRef.current.push(conn);
-        
         conn.on('open', () => {
-           // On Join, assign Blue to first Guest for now
-           // In a full implementation, find first available non-host slot
-           setPlayerProfiles(prev => {
-               const newProfiles = { ...prev };
-               newProfiles[PlayerColor.BLUE] = { ...newProfiles[PlayerColor.BLUE], isBot: false, isRemote: true, name: 'Guest' };
+           // Assign a unique color to this connection
+           const assignedColors = [PlayerColor.RED, ...connectionsRef.current.map(c => c.color)];
+           const allColors = [PlayerColor.BLUE, PlayerColor.GREEN, PlayerColor.YELLOW]; // Preference order
+           const nextColor = allColors.find(c => !assignedColors.includes(c));
+
+           if (nextColor) {
+               // Successful Join
+               connectionsRef.current.push({ conn, color: nextColor });
                
-               // Sync immediately
-               conn.send({ type: 'WELCOME', color: PlayerColor.BLUE });
-               conn.send({ type: 'SYNC', payload: { gameState, playerProfiles: newProfiles, turnStep, moveTimer } });
-               return newProfiles;
-           });
+               setPlayerProfiles(prev => {
+                   const newProfiles = { ...prev };
+                   newProfiles[nextColor] = { 
+                       ...newProfiles[nextColor], 
+                       isBot: false, 
+                       isRemote: true, 
+                       name: `Player ${connectionsRef.current.length + 1}` 
+                   };
+                   
+                   // Sync immediately with new profile
+                   conn.send({ type: 'WELCOME', color: nextColor });
+                   broadcastState({ profiles: newProfiles });
+                   return newProfiles;
+               });
+           } else {
+               // Room Full
+               conn.send({ type: 'ERROR', message: 'Room is full (4 players max)' });
+               setTimeout(() => conn.close(), 500);
+           }
         });
 
         conn.on('data', (data: any) => {
+           // Find which color this connection is
+           const sender = connectionsRef.current.find(c => c.conn === conn);
+           if (!sender) return;
+
+           const senderColor = sender.color;
+
            if (data.type === 'ROLL') {
-               handleRollDice(true); // Force system roll on behalf of remote
+               // Only allow if it's their turn
+               setGameState(current => {
+                   if (current.currentPlayer === senderColor && !current.isRolling && !current.diceValue) {
+                       // We can't update state inside callback like this safely for complex logic, 
+                       // so we trigger the handler via effect or direct call.
+                       // For simplicity, we'll allow the effect loop or handleRollDice to check validity.
+                       handleRollDice(true, senderColor); 
+                   }
+                   return current;
+               });
            } else if (data.type === 'MOVE') {
-               handleTokenClick(data.tokenId, true); // Force move on behalf of remote
+               handleTokenClick(data.tokenId, true, senderColor);
            } else if (data.type === 'UPDATE_PROFILE') {
                setPlayerProfiles(prev => ({
                    ...prev,
-                   [data.color]: { ...prev[data.color], ...data.updates }
+                   [senderColor]: { ...prev[senderColor], ...data.updates }
                }));
            }
         });
         
         conn.on('close', () => {
-             connectionsRef.current = connectionsRef.current.filter(c => c !== conn);
-             // Could revert player to Bot, but let's leave as is for now
+             const disconnected = connectionsRef.current.find(c => c.conn === conn);
+             if (disconnected) {
+                 connectionsRef.current = connectionsRef.current.filter(c => c.conn !== conn);
+                 setPlayerProfiles(prev => ({
+                     ...prev,
+                     [disconnected.color]: { ...prev[disconnected.color], isRemote: false, name: 'Disconnected' }
+                 }));
+             }
         });
       });
     }
@@ -290,13 +330,27 @@ export default function App() {
     return () => peer.destroy();
   }, [hostId, isHost]);
 
-  // Host: Broadcast State on Change (Including moveTimer)
+  // Host: Broadcast helper
+  const broadcastState = (overrides?: { gs?: GameState, profiles?: any, step?: any, timer?: number }) => {
+      if (!isHost) return;
+      const payload = { 
+          type: 'SYNC', 
+          payload: { 
+              gameState: overrides?.gs || gameState, 
+              playerProfiles: overrides?.profiles || playerProfiles, 
+              turnStep: overrides?.step || turnStep, 
+              moveTimer: overrides?.timer !== undefined ? overrides.timer : moveTimer 
+          } 
+      };
+      connectionsRef.current.forEach(c => {
+          if (c.conn.open) c.conn.send(payload);
+      });
+  };
+
+  // Host: Broadcast State on Change
   useEffect(() => {
-      if (isHost && connectionsRef.current.length > 0) {
-          const payload = { type: 'SYNC', payload: { gameState, playerProfiles, turnStep, moveTimer } };
-          connectionsRef.current.forEach(conn => {
-              if (conn.open) conn.send(payload);
-          });
+      if (isHost) {
+          broadcastState();
       }
   }, [gameState, playerProfiles, turnStep, moveTimer, isHost]);
 
@@ -305,40 +359,31 @@ export default function App() {
     applauseRef.current = new Audio("https://actions.google.com/sounds/v1/crowds/applause_large_crowd.ogg");
   }, []);
 
-  // --- Strict Identity Logic & Bot Automation ---
+  // --- Strict Identity & Bot Logic ---
   useEffect(() => {
-    // Only Host runs bots! Guest is purely a viewer/inputter.
     if (!isHost) return;
 
-    // Logic to update local profile based on myColor (Host is Red)
-    if (gameState.status === 'PLAYING' && gameState.winner === null && gameState.currentPlayer !== myColor) {
+    if (gameState.status === 'PLAYING' && gameState.winner === null) {
         const currentPlayerProfile = playerProfiles[gameState.currentPlayer];
         
-        if (currentPlayerProfile.isActive && currentPlayerProfile.isBot) {
-            // Bot Logic
-            if (!gameState.isRolling && !gameState.diceValue && turnStep === 'ROLL') {
-                const timer = setTimeout(() => {
-                    handleRollDice(true);
-                }, 1000);
-                return () => clearTimeout(timer);
-            }
+        // Host (Red) Auto-actions only if Host is AFK? No, we don't auto-play for Host unless 'isBot' is true.
+        // Currently Host is always human (isBot: false).
 
-            if (turnStep === 'MOVE' && !gameState.isMoving && gameState.diceValue) {
-                const timer = setTimeout(() => {
-                    executeBotMove();
-                }, 1500);
-                return () => clearTimeout(timer);
-            }
-        } else if (!currentPlayerProfile.isActive) {
-             finishTurn(gameState.tokens, `${playerProfiles[gameState.currentPlayer].name} skipped.`, false);
-        }
+        // Bot Logic for unfilled slots that might have been left as bots (optional, but requested behavior is "remove them")
+        // The requested behavior is: "If less than 4 players, remove the others". 
+        // So effectively, there are NO bots in this version.
+        
+        // Skip logic for inactive players is handled in finishTurn.
     }
-  }, [gameState, turnStep, playerProfiles, isHost, myColor]);
+  }, [gameState, turnStep, playerProfiles, isHost]);
 
   // --- Start Game Logic ---
   const handleStartGame = () => {
       setMenuOpen(false);
       setCountDown(10);
+      
+      // Update profiles immediately to show host initiated countdown
+      setGameState(prev => ({ ...prev, gameLog: [...prev.gameLog, "Host started countdown..."] }));
   };
 
   useEffect(() => {
@@ -348,26 +393,51 @@ export default function App() {
           return () => clearTimeout(timer);
       } else {
           // Timer finished: Start Game
-          if (!isHost) return; // Only Host commits the start
+          if (!isHost) return; 
 
           setCountDown(null);
-          setManualLock(true); // Automatically lock entry
+          setManualLock(true); 
           
-          // Remove tokens of inactive players
-          const activeColors = Object.entries(playerProfiles)
-              .filter(([_, p]) => (p as PlayerProfile).isActive)
-              .map(([color]) => color);
+          // Determine who is actually playing
+          // Red is Host (always active)
+          // Others are active ONLY if isRemote is true (meaning a human is connected)
+          
+          setPlayerProfiles(prevProfiles => {
+              const newProfiles = { ...prevProfiles };
+              const activeColors: PlayerColor[] = [];
               
-          const newTokens = INITIAL_TOKENS.filter(t => activeColors.includes(t.color));
+              (Object.keys(newProfiles) as PlayerColor[]).forEach(color => {
+                  if (color === PlayerColor.RED) {
+                      newProfiles[color].isActive = true;
+                      activeColors.push(color);
+                  } else {
+                      if (newProfiles[color].isRemote) {
+                          newProfiles[color].isActive = true;
+                          activeColors.push(color);
+                      } else {
+                          // No player connected, remove this color from game
+                          newProfiles[color].isActive = false;
+                      }
+                  }
+              });
 
-          setGameState(prev => ({ 
-              ...prev, 
-              tokens: newTokens,
-              status: 'PLAYING',
-              gameLog: ["Game Started! Good luck."] 
-          }));
+              // Filter tokens to only include active players
+              const newTokens = INITIAL_TOKENS.filter(t => activeColors.includes(t.color));
+              
+              const newGameState = { 
+                  ...gameState, 
+                  tokens: newTokens,
+                  status: 'PLAYING' as const, // Explicit cast
+                  gameLog: ["Game Started!"] 
+              };
+
+              setGameState(newGameState);
+              broadcastState({ gs: newGameState, profiles: newProfiles });
+              
+              return newProfiles;
+          });
       }
-  }, [countDown, playerProfiles, isHost]);
+  }, [countDown, isHost]);
 
   // --- Winning Logic ---
   const checkWinCondition = (tokens: Token[], player: PlayerColor) => {
@@ -384,34 +454,6 @@ export default function App() {
           applauseRef.current.currentTime = 0;
           applauseRef.current.play().catch(() => {});
       }
-
-      setTimeout(() => {
-          kickAllExceptMe();
-          if (applauseRef.current) {
-              applauseRef.current.pause();
-          }
-      }, 30000);
-  };
-
-  const kickAllExceptMe = () => {
-      if (!isHost) return;
-      setPlayerProfiles((prev: Record<PlayerColor, PlayerProfile>) => {
-          const next = { ...prev };
-          (Object.keys(next) as PlayerColor[]).forEach((key) => {
-              if (key !== myColor) {
-                  const profile = next[key];
-                  if (profile) {
-                      next[key] = { ...profile, isActive: false };
-                  }
-              }
-          });
-          return next;
-      });
-      setGameState(prev => ({
-          ...prev,
-          tokens: prev.tokens.filter(t => t.color === myColor),
-          gameLog: [...prev.gameLog, "Everyone else has been removed."]
-      }));
   };
 
   const handleAdmitNextPlayers = () => {
@@ -430,25 +472,79 @@ export default function App() {
       setManualLock(false);
       setMenuOpen(false);
       
-      setPlayerProfiles((prev: Record<PlayerColor, PlayerProfile>) => {
+      // Reset all slots to waiting
+      setPlayerProfiles(prev => {
           const next = { ...prev };
           (Object.keys(next) as PlayerColor[]).forEach((k) => {
-              next[k] = { ...next[k], isActive: true };
+              // Keep remote connections, just reset status logic if needed
+              // Actually we want to keep connected players
+              if (k === PlayerColor.RED || next[k].isRemote) {
+                  next[k].isActive = true;
+              } else {
+                  next[k].isActive = true; // Open lobby back up visually
+              }
           });
           return next;
       });
   };
 
-  // --- Bot / AI Move Logic ---
-  const executeBotMove = () => {
-      const validTokens = getSelectableTokens();
-      if (validTokens.length > 0) {
-          const tokenObjs = gameState.tokens.filter(t => validTokens.includes(t.id));
-          tokenObjs.sort((a,b) => b.position - a.position);
-          handleTokenClick(tokenObjs[0].id, true);
+  // --- Handlers ---
+  const handleRollDice = (forceSystemInput: boolean = false, requestingColor?: PlayerColor) => {
+    // 1. Identification Check
+    if (isHost) {
+        // I am Host.
+        // If it's a forced system input (from network or timer), proceed.
+        // If it's a manual click (forceSystemInput=false), ensure it is MY turn (Red).
+        if (!forceSystemInput && gameState.currentPlayer !== PlayerColor.RED) return;
+        
+        // If network request, ensure the requester matches the current player
+        if (requestingColor && requestingColor !== gameState.currentPlayer) return;
+    } else {
+        // I am Guest.
+        // Send request to Host.
+        if (gameState.currentPlayer === myColor && connectionRef.current?.open) {
+            connectionRef.current.send({ type: 'ROLL' });
+        }
+        return; // Client stops here, waits for sync
+    }
+
+    if (gameState.winner) return;
+    if (gameState.status !== 'PLAYING') return; 
+    if (gameState.isRolling || gameState.isMoving) return;
+    if (gameState.diceValue !== null) return; // Already rolled
+    
+    setGameState(prev => ({ ...prev, isRolling: true }));
+
+    setTimeout(() => {
+      const newValue = Math.floor(Math.random() * 6) + 1;
+      const newLog = [...gameState.gameLog.slice(-4), `${playerProfiles[gameState.currentPlayer].name} rolled a ${newValue}`];
+
+      setGameState(prev => {
+        const nextState = {
+            ...prev,
+            isRolling: false,
+            diceValue: newValue,
+            gameLog: newLog
+        };
+        
+        // Check moves immediately after state update (in next render cycle effectively, 
+        // but for Host logic we need to determine next step)
+        return nextState;
+      });
+
+      // Logic to determine if move is possible needs the new value
+      const canMove = hasValidMoves(gameState.currentPlayer, newValue, gameState.tokens);
+
+      if (canMove) {
+          setTurnStep('MOVE');
+          setMoveTimer(15); 
       } else {
-           finishTurn(gameState.tokens, `No moves for ${playerProfiles[gameState.currentPlayer].name}.`, false);
+          setTurnStep('MOVE'); // Still switch to MOVE phase to show "No moves"
+          setTimeout(() => {
+              finishTurn(gameState.tokens, `No valid moves for ${playerProfiles[gameState.currentPlayer].name}.`, false);
+          }, 1500); 
       }
+    }, 800);
   };
 
   const hasValidMoves = (player: PlayerColor, dice: number, tokens: Token[]) => {
@@ -458,50 +554,6 @@ export default function App() {
              if (t.position === -1) return dice === 6;
              return (t.position + dice) <= 56;
         });
-  };
-
-  // --- Handlers ---
-  const handleRollDice = (forceSystemInput: any = false) => {
-    // Explicitly check boolean to prevent Event objects from triggering forceSystem
-    const forceSystem = forceSystemInput === true;
-
-    // If Guest, send Request to Host
-    if (!isHost) {
-        if (gameState.currentPlayer === myColor && connectionRef.current?.open) {
-            connectionRef.current.send({ type: 'ROLL' });
-        }
-        return;
-    }
-
-    if (!forceSystem && gameState.currentPlayer !== myColor) return;
-    if (gameState.winner) return;
-    if (gameState.status !== 'PLAYING') return; 
-
-    if (gameState.isRolling || gameState.isMoving) return;
-    
-    setGameState(prev => ({ ...prev, isRolling: true }));
-
-    setTimeout(() => {
-      const newValue = Math.floor(Math.random() * 6) + 1;
-      const newLog = [...gameState.gameLog.slice(-4), `${playerProfiles[gameState.currentPlayer].name} rolled a ${newValue}`];
-
-      setGameState(prev => ({
-        ...prev,
-        isRolling: false,
-        diceValue: newValue,
-        gameLog: newLog
-      }));
-
-      if (hasValidMoves(gameState.currentPlayer, newValue, gameState.tokens)) {
-          setTurnStep('MOVE');
-          setMoveTimer(15); 
-      } else {
-          setTurnStep('MOVE'); 
-          setTimeout(() => {
-              finishTurn(gameState.tokens, `No valid moves for ${playerProfiles[gameState.currentPlayer].name}.`, false);
-          }, 1500); 
-      }
-    }, 800);
   };
 
   const finishTurn = (tokens: Token[], logMessage: string, rolledSix: boolean) => {
@@ -520,6 +572,11 @@ export default function App() {
               nextIdx = (nextIdx + 1) % 4;
               loops++;
           } while (!playerProfiles[order[nextIdx]].isActive && loops < 4);
+          
+          if (loops >= 4) {
+             // Everyone is inactive? (Shouldn't happen)
+             return;
+          }
           nextPlayer = order[nextIdx];
       }
 
@@ -536,11 +593,15 @@ export default function App() {
       setMoveTimer(15); 
   };
 
-  const handleTokenClick = async (tokenId: string, forceSystemInput: any = false) => {
-    const forceSystem = forceSystemInput === true;
-
-    // If Guest, send Request to Host
-    if (!isHost) {
+  const handleTokenClick = async (tokenId: string, forceSystemInput: boolean = false, requestingColor?: PlayerColor) => {
+    // 1. Identification Check
+    if (isHost) {
+        // If manual click, must be Red
+        if (!forceSystemInput && gameState.currentPlayer !== PlayerColor.RED) return;
+        // If network request, must be from current player
+        if (requestingColor && requestingColor !== gameState.currentPlayer) return;
+    } else {
+        // Guest: Request Move
         if (gameState.currentPlayer === myColor && connectionRef.current?.open) {
              const token = gameState.tokens.find(t => t.id === tokenId);
              if (token && token.color === myColor) {
@@ -553,11 +614,6 @@ export default function App() {
     if (gameState.winner) return;
     const token = gameState.tokens.find(t => t.id === tokenId);
     if (!token) return;
-
-    if (!forceSystem) {
-        if (gameState.currentPlayer !== myColor) return;
-        if (token.color !== myColor) return;
-    }
 
     if (gameState.isMoving || !gameState.diceValue) return;
     if (token.color !== gameState.currentPlayer) return;
@@ -576,6 +632,7 @@ export default function App() {
         endPos = startPos + diceVal;
     }
 
+    // Animation loop
     if (startPos !== -1) {
         for (let i = startPos + 1; i <= endPos; i++) {
              setGameState(prev => ({
@@ -592,6 +649,7 @@ export default function App() {
          await new Promise(r => setTimeout(r, 250));
     }
 
+    // Determine final state after animation
     const finalPos = endPos; 
     let captureOccurred = false;
     let captureLog = "";
@@ -620,10 +678,8 @@ export default function App() {
         }
     }
 
-    // Set Capture event in State to broadcast it
     if (newCaptureEvent) {
          setGameState(prev => ({ ...prev, captureEvent: newCaptureEvent }));
-         // Clear it shortly after so it doesn't persist
          setTimeout(() => {
              setGameState(prev => ({ ...prev, captureEvent: null }));
          }, 1500);
@@ -655,7 +711,6 @@ export default function App() {
   };
 
   const handleCopyLink = () => {
-    // Generate Invite Link with ?hostId=PEER_ID
     const url = new URL(window.location.href);
     url.searchParams.delete('mode');
     url.searchParams.set('hostId', peerId);
@@ -690,13 +745,16 @@ export default function App() {
   
   const kickPlayer = (color: PlayerColor) => {
       if (!isHost) return;
+      // Find connection with this color and close it
+      const connectionInfo = connectionsRef.current.find(c => c.color === color);
+      if (connectionInfo) {
+          connectionInfo.conn.close();
+          connectionsRef.current = connectionsRef.current.filter(c => c.color !== color);
+      }
+
       setPlayerProfiles(prev => ({
           ...prev,
-          [color]: { ...prev[color], isActive: false }
-      }));
-      setGameState(prev => ({
-          ...prev,
-          tokens: prev.tokens.filter(t => t.color !== color)
+          [color]: { ...prev[color], isActive: false, isRemote: false, name: 'Empty' }
       }));
   };
 
@@ -720,45 +778,38 @@ export default function App() {
 
       let interval: any;
       if (gameState.status === 'PLAYING' && !gameState.winner && !gameState.isMoving && !gameState.isRolling) {
-          // Timer active during both ROLL and MOVE steps
           if (moveTimer > 0) {
               interval = setInterval(() => {
                   setMoveTimer(prev => prev - 1);
               }, 1000);
           } else {
-              // Timer Reached 0
-              if (gameState.currentPlayer === myColor || playerProfiles[gameState.currentPlayer].isRemote) {
-                  // Action for "Me" or "Remote Player" (Auto-roll/move if timeout)
-                  if (turnStep === 'ROLL') {
-                      handleRollDice(true); // Auto roll
-                  } else if (turnStep === 'MOVE') {
-                      if (selectableTokens.length > 0) {
-                          const bestToken = gameState.tokens
-                                  .filter(t => selectableTokens.includes(t.id))
-                                  .sort((a,b) => b.position - a.position)[0];
-                          if(bestToken) handleTokenClick(bestToken.id, true);
-                      } else {
-                          finishTurn(gameState.tokens, "Time's up!", false);
-                      }
+              // Timer Reached 0 - Auto Turn Logic
+              if (turnStep === 'ROLL') {
+                  handleRollDice(true); // System auto-roll
+              } else if (turnStep === 'MOVE') {
+                  if (selectableTokens.length > 0) {
+                      const bestToken = gameState.tokens
+                              .filter(t => selectableTokens.includes(t.id))
+                              .sort((a,b) => b.position - a.position)[0];
+                      if(bestToken) handleTokenClick(bestToken.id, true);
+                  } else {
+                      finishTurn(gameState.tokens, "Time's up!", false);
                   }
               }
-              // Bots handle their own timing in the other useEffect
           }
       }
       return () => clearInterval(interval);
-  }, [turnStep, moveTimer, selectableTokens, gameState.currentPlayer, myColor, gameState.winner, gameState.status, gameState.isMoving, gameState.isRolling, isHost, playerProfiles]);
+  }, [turnStep, moveTimer, selectableTokens, gameState.currentPlayer, myColor, gameState.winner, gameState.status, gameState.isMoving, gameState.isRolling, isHost]);
 
-  // --- Queue Screen Component ---
+  // --- Queue Screen Component (Guest View) ---
   if (isQueueMode) {
       return (
           <div className="min-h-screen bg-black flex flex-col items-center justify-center p-4">
               <h1 className="text-white text-2xl font-bold mb-8">Waiting Queue</h1>
-              
               {!queueSpotTaken ? (
                   <button 
                       onClick={() => {
                           setQueueSpotTaken(true);
-                          setQueueEntryTime(Date.now());
                       }}
                       className="bg-green-600 hover:bg-green-500 text-white font-bold py-6 px-12 rounded-2xl text-xl shadow-[0_0_20px_rgba(34,197,94,0.6)] transition-all transform hover:scale-105"
                   >
@@ -768,21 +819,6 @@ export default function App() {
                   <div className="flex flex-col items-center gap-4">
                       <div className="text-green-400 font-mono text-xl animate-pulse">Position Reserved</div>
                       <p className="text-slate-500 text-sm">Please wait for the current game to finish.</p>
-                      
-                      {gameState.status === 'LOBBY' && (
-                          <div className="mt-8 flex flex-col items-center animate-bounce">
-                             <p className="text-yellow-400 font-bold mb-2">You're Up!</p>
-                             <button 
-                                onClick={() => { setIsQueueMode(false); setQueueSpotTaken(false); }}
-                                className="bg-blue-600 hover:bg-blue-500 text-white py-3 px-8 rounded-xl font-bold"
-                             >
-                                 ENTER GAME
-                             </button>
-                             <div className="h-1 w-full bg-slate-800 rounded mt-2 overflow-hidden">
-                                 <div className="h-full bg-yellow-500 w-full animate-[width_60s_linear_forwards]"></div>
-                             </div>
-                          </div>
-                      )}
                   </div>
               )}
           </div>
@@ -794,10 +830,11 @@ export default function App() {
        
        {/* COUNTDOWN OVERLAY */}
        {countDown !== null && (
-           <div className="fixed inset-0 z-[100] bg-black flex items-center justify-center">
+           <div className="fixed inset-0 z-[100] bg-black/80 flex items-center justify-center">
                <div className="text-[12rem] font-black text-white animate-pulse">
                    {countDown}
                </div>
+               <div className="absolute bottom-10 text-white text-xl">Game Starting...</div>
            </div>
        )}
        
@@ -887,7 +924,7 @@ export default function App() {
                                 onClick={handleAdmitNextPlayers}
                                 className="w-full bg-blue-600 hover:bg-blue-500 text-white font-bold py-3 rounded-lg flex items-center justify-center gap-2 shadow-lg animate-pulse"
                             >
-                                <UserPlus size={18}/> Admit Next Players
+                                <UserPlus size={18}/> New Game
                             </button>
                         )}
                     </div>
@@ -895,22 +932,22 @@ export default function App() {
                     {/* Active Players List */}
                     <div className="bg-slate-900/50 rounded-lg p-3 border border-slate-700/50 mt-2">
                          <div className="flex items-center gap-2 mb-2 text-slate-400 text-xs font-bold uppercase tracking-wider">
-                            <Users size={12} /> Active Players
+                            <Users size={12} /> Connected Players
                          </div>
                          <div className="space-y-2">
                             {Object.values(PlayerColor).map(c => {
                                 const p = playerProfiles[c];
-                                if (!p.isActive) return null;
+                                if (!p.isActive && !p.isRemote && c !== PlayerColor.RED) return null;
                                 return (
                                 <div key={c} className="flex justify-between items-center text-xs group">
                                      <div className="flex items-center gap-2">
                                         <div className="w-2 h-2 rounded-full shadow-sm" style={{backgroundColor: COLORS[c].main}}></div>
                                         <span className={`font-medium ${c === myColor ? 'text-white' : 'text-slate-400'}`}>
                                             {p.name} {c === myColor ? '(You)' : ''}
-                                            {p.isRemote && !p.isBot && <span className="ml-1 text-[10px] bg-blue-900 text-blue-300 px-1 rounded">NET</span>}
+                                            {p.isRemote && <span className="ml-1 text-[10px] bg-blue-900 text-blue-300 px-1 rounded">NET</span>}
                                         </span>
                                      </div>
-                                     {c !== myColor && (
+                                     {c !== myColor && c !== PlayerColor.RED && p.isRemote && (
                                          <button 
                                             onClick={() => kickPlayer(c)}
                                             className="text-red-500 hover:bg-red-500/20 p-1 rounded opacity-0 group-hover:opacity-100 transition-all"
@@ -934,7 +971,7 @@ export default function App() {
                         ${(!peerId) ? 'bg-slate-700 text-slate-500 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-500 text-white'}
                         `}
                     >
-                        <span className="flex items-center gap-2"><LinkIcon size={14}/> Invite Friend</span>
+                        <span className="flex items-center gap-2"><LinkIcon size={14}/> Invite Link</span>
                         {peerId && (linkCopied ? <Check size={14}/> : <Copy size={14}/>)}
                     </button>
                     
@@ -995,7 +1032,7 @@ export default function App() {
             highlightedTokens={selectableTokens}
             diceValue={gameState.diceValue}
             isRolling={gameState.isRolling}
-            onDiceClick={() => handleRollDice()} // Explicitly call without args to avoid Event object passing
+            onDiceClick={() => handleRollDice()} // Manual click via UI
             currentPlayer={gameState.currentPlayer}
             turnStep={turnStep}
             moveTimer={moveTimer}
