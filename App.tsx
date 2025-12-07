@@ -240,6 +240,8 @@ export default function App() {
              setGameState(data.payload.gameState);
              setPlayerProfiles(data.payload.playerProfiles);
              if (data.payload.turnStep) setTurnStep(data.payload.turnStep);
+             // Sync Timer
+             if (typeof data.payload.moveTimer === 'number') setMoveTimer(data.payload.moveTimer);
           } else if (data.type === 'WELCOME') {
              setMyColor(data.color);
           }
@@ -260,7 +262,7 @@ export default function App() {
                
                // Sync immediately
                conn.send({ type: 'WELCOME', color: PlayerColor.BLUE });
-               conn.send({ type: 'SYNC', payload: { gameState, playerProfiles: newProfiles, turnStep } });
+               conn.send({ type: 'SYNC', payload: { gameState, playerProfiles: newProfiles, turnStep, moveTimer } });
                return newProfiles;
            });
         });
@@ -288,15 +290,15 @@ export default function App() {
     return () => peer.destroy();
   }, [hostId, isHost]);
 
-  // Host: Broadcast State on Change
+  // Host: Broadcast State on Change (Including moveTimer)
   useEffect(() => {
       if (isHost && connectionsRef.current.length > 0) {
-          const payload = { type: 'SYNC', payload: { gameState, playerProfiles, turnStep } };
+          const payload = { type: 'SYNC', payload: { gameState, playerProfiles, turnStep, moveTimer } };
           connectionsRef.current.forEach(conn => {
               if (conn.open) conn.send(payload);
           });
       }
-  }, [gameState, playerProfiles, turnStep, isHost]);
+  }, [gameState, playerProfiles, turnStep, moveTimer, isHost]);
 
   // Initialize Applause Sound
   useEffect(() => {
@@ -459,7 +461,10 @@ export default function App() {
   };
 
   // --- Handlers ---
-  const handleRollDice = (forceSystem = false) => {
+  const handleRollDice = (forceSystemInput: any = false) => {
+    // Explicitly check boolean to prevent Event objects from triggering forceSystem
+    const forceSystem = forceSystemInput === true;
+
     // If Guest, send Request to Host
     if (!isHost) {
         if (gameState.currentPlayer === myColor && connectionRef.current?.open) {
@@ -531,7 +536,9 @@ export default function App() {
       setMoveTimer(15); 
   };
 
-  const handleTokenClick = async (tokenId: string, forceSystem = false) => {
+  const handleTokenClick = async (tokenId: string, forceSystemInput: any = false) => {
+    const forceSystem = forceSystemInput === true;
+
     // If Guest, send Request to Host
     if (!isHost) {
         if (gameState.currentPlayer === myColor && connectionRef.current?.open) {
@@ -988,7 +995,7 @@ export default function App() {
             highlightedTokens={selectableTokens}
             diceValue={gameState.diceValue}
             isRolling={gameState.isRolling}
-            onDiceClick={handleRollDice}
+            onDiceClick={() => handleRollDice()} // Explicitly call without args to avoid Event object passing
             currentPlayer={gameState.currentPlayer}
             turnStep={turnStep}
             moveTimer={moveTimer}

@@ -529,7 +529,7 @@ export const LudoBoard: React.FC<LudoBoardProps> = ({
              <ThreeDDice 
                 value={diceValue || 1} 
                 isRolling={isRolling}
-                onClick={!isRolling && turnStep === 'ROLL' ? onDiceClick : undefined}
+                onClick={() => !isRolling && turnStep === 'ROLL' && onDiceClick()}
                 size={window.innerWidth < 768 ? 30 : 40}
                 disabled={turnStep !== 'ROLL'}
              />
