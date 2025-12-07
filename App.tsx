@@ -1,8 +1,11 @@
+
 import React, { useState, useEffect, useRef } from 'react';
 import { LudoBoard } from './components/LudoBoard';
 import { PlayerColor, GameState, Token, PlayerProfile } from './types';
 import { INITIAL_TOKENS, COLORS, START_OFFSETS, SAFE_SPOTS } from './constants';
-import { Trophy, Menu, X, Link as LinkIcon, Copy, Check, Upload, Music, Globe, Users, Play, Ban, Lock, Unlock, UserPlus } from 'lucide-react';
+import { Trophy, Menu, X, Link as LinkIcon, Copy, Check, Upload, Music, Globe, Users, Play, Ban, Lock, Unlock, UserPlus, Zap } from 'lucide-react';
+
+declare var Peer: any;
 
 // Country List for Selector
 const COUNTRIES = [
@@ -163,14 +166,14 @@ const Confetti = () => {
 };
 
 export default function App() {
-  // --- Identity Logic (Host vs Guest) ---
-  // Host is always Red. Guests are assigned Blue (or others).
-  const [myColor] = useState<PlayerColor>(() => {
-      const params = new URLSearchParams(window.location.search);
-      // If ?mode=guest is present, user is Blue. Otherwise Red (Host).
-      return params.get('mode') === 'guest' ? PlayerColor.BLUE : PlayerColor.RED;
-  });
-  const isHost = myColor === PlayerColor.RED;
+  // --- Multiplayer Identity & PeerJS ---
+  const [peerId, setPeerId] = useState<string>('');
+  const [hostId] = useState(() => new URLSearchParams(window.location.search).get('hostId'));
+  const isHost = !hostId;
+  const connectionsRef = useRef<any[]>([]); // For Host
+  const connectionRef = useRef<any>(null); // For Guest
+
+  const [myColor, setMyColor] = useState<PlayerColor>(isHost ? PlayerColor.RED : PlayerColor.BLUE);
 
   // Game State
   const [gameState, setGameState] = useState<GameState>({
@@ -179,8 +182,10 @@ export default function App() {
     diceValue: null,
     isRolling: false,
     isMoving: false,
-    gameLog: ["Waiting for game to start..."],
+    gameLog: ["Waiting for players..."],
     winner: null,
+    status: 'LOBBY',
+    captureEvent: null,
   });
 
   // Flow Control
@@ -189,7 +194,6 @@ export default function App() {
   const [linkCopied, setLinkCopied] = useState(false);
   
   // Game Lifecycle
-  const [gameLocked, setGameLocked] = useState(false);
   const [manualLock, setManualLock] = useState(false);
   const [countDown, setCountDown] = useState<number | null>(null);
   
@@ -197,27 +201,11 @@ export default function App() {
   const applauseRef = useRef<HTMLAudioElement | null>(null);
 
   // Player Profiles
-  const [playerProfiles, setPlayerProfiles] = useState<Record<PlayerColor, PlayerProfile>>(() => {
-      // If I am Host (Red), everyone else is a Bot.
-      // If I am Guest (Blue), everyone else is a Bot (including Host).
-      const isRedMe = myColor === PlayerColor.RED;
-      
-      return {
-        [PlayerColor.BLUE]: { 
-            name: isRedMe ? 'Player 1' : 'You', 
-            flag: null, 
-            isActive: true, 
-            isBot: isRedMe // Bot if I am Host
-        },
-        [PlayerColor.RED]: { 
-            name: isRedMe ? 'You (Host)' : 'Host', 
-            flag: null, 
-            isActive: true, 
-            isBot: !isRedMe // Bot if I am Guest
-        },
-        [PlayerColor.GREEN]: { name: 'Player 3', flag: null, isActive: true, isBot: true },
-        [PlayerColor.YELLOW]: { name: 'Player 4', flag: null, isActive: true, isBot: true },
-      };
+  const [playerProfiles, setPlayerProfiles] = useState<Record<PlayerColor, PlayerProfile>>({
+    [PlayerColor.BLUE]: { name: 'Player 1', flag: null, isActive: true, isBot: true },
+    [PlayerColor.RED]: { name: 'Host', flag: null, isActive: true, isBot: false },
+    [PlayerColor.GREEN]: { name: 'Player 3', flag: null, isActive: true, isBot: true },
+    [PlayerColor.YELLOW]: { name: 'Player 4', flag: null, isActive: true, isBot: true },
   });
   
   // Sound
@@ -226,13 +214,89 @@ export default function App() {
   // Timer State
   const [moveTimer, setMoveTimer] = useState(15);
   
-  // Capture Event for Animation
-  const [captureEvent, setCaptureEvent] = useState<{ globalIndex: number } | null>(null);
-
   // Queue System
   const [isQueueMode, setIsQueueMode] = useState(false); 
   const [queueSpotTaken, setQueueSpotTaken] = useState(false);
   const [queueEntryTime, setQueueEntryTime] = useState<number | null>(null);
+
+  // --- PeerJS Logic ---
+  useEffect(() => {
+    const peer = new Peer(undefined, { debug: 1 });
+
+    peer.on('open', (id: string) => {
+      setPeerId(id);
+      
+      if (!isHost && hostId) {
+        // I am Guest, connect to Host
+        const conn = peer.connect(hostId);
+        connectionRef.current = conn;
+
+        conn.on('open', () => {
+          conn.send({ type: 'JOIN' });
+        });
+
+        conn.on('data', (data: any) => {
+          if (data.type === 'SYNC') {
+             setGameState(data.payload.gameState);
+             setPlayerProfiles(data.payload.playerProfiles);
+             if (data.payload.turnStep) setTurnStep(data.payload.turnStep);
+          } else if (data.type === 'WELCOME') {
+             setMyColor(data.color);
+          }
+        });
+      }
+    });
+
+    if (isHost) {
+      peer.on('connection', (conn: any) => {
+        connectionsRef.current.push(conn);
+        
+        conn.on('open', () => {
+           // On Join, assign Blue to first Guest for now
+           // In a full implementation, find first available non-host slot
+           setPlayerProfiles(prev => {
+               const newProfiles = { ...prev };
+               newProfiles[PlayerColor.BLUE] = { ...newProfiles[PlayerColor.BLUE], isBot: false, isRemote: true, name: 'Guest' };
+               
+               // Sync immediately
+               conn.send({ type: 'WELCOME', color: PlayerColor.BLUE });
+               conn.send({ type: 'SYNC', payload: { gameState, playerProfiles: newProfiles, turnStep } });
+               return newProfiles;
+           });
+        });
+
+        conn.on('data', (data: any) => {
+           if (data.type === 'ROLL') {
+               handleRollDice(true); // Force system roll on behalf of remote
+           } else if (data.type === 'MOVE') {
+               handleTokenClick(data.tokenId, true); // Force move on behalf of remote
+           } else if (data.type === 'UPDATE_PROFILE') {
+               setPlayerProfiles(prev => ({
+                   ...prev,
+                   [data.color]: { ...prev[data.color], ...data.updates }
+               }));
+           }
+        });
+        
+        conn.on('close', () => {
+             connectionsRef.current = connectionsRef.current.filter(c => c !== conn);
+             // Could revert player to Bot, but let's leave as is for now
+        });
+      });
+    }
+
+    return () => peer.destroy();
+  }, [hostId, isHost]);
+
+  // Host: Broadcast State on Change
+  useEffect(() => {
+      if (isHost && connectionsRef.current.length > 0) {
+          const payload = { type: 'SYNC', payload: { gameState, playerProfiles, turnStep } };
+          connectionsRef.current.forEach(conn => {
+              if (conn.open) conn.send(payload);
+          });
+      }
+  }, [gameState, playerProfiles, turnStep, isHost]);
 
   // Initialize Applause Sound
   useEffect(() => {
@@ -241,7 +305,11 @@ export default function App() {
 
   // --- Strict Identity Logic & Bot Automation ---
   useEffect(() => {
-    if (gameLocked && gameState.winner === null && gameState.currentPlayer !== myColor) {
+    // Only Host runs bots! Guest is purely a viewer/inputter.
+    if (!isHost) return;
+
+    // Logic to update local profile based on myColor (Host is Red)
+    if (gameState.status === 'PLAYING' && gameState.winner === null && gameState.currentPlayer !== myColor) {
         const currentPlayerProfile = playerProfiles[gameState.currentPlayer];
         
         if (currentPlayerProfile.isActive && currentPlayerProfile.isBot) {
@@ -263,7 +331,7 @@ export default function App() {
              finishTurn(gameState.tokens, `${playerProfiles[gameState.currentPlayer].name} skipped.`, false);
         }
     }
-  }, [gameState.currentPlayer, gameState.diceValue, turnStep, gameLocked, gameState.winner, gameState.isRolling, gameState.isMoving]);
+  }, [gameState, turnStep, playerProfiles, isHost, myColor]);
 
   // --- Start Game Logic ---
   const handleStartGame = () => {
@@ -278,13 +346,14 @@ export default function App() {
           return () => clearTimeout(timer);
       } else {
           // Timer finished: Start Game
+          if (!isHost) return; // Only Host commits the start
+
           setCountDown(null);
-          setGameLocked(true); 
           setManualLock(true); // Automatically lock entry
           
           // Remove tokens of inactive players
           const activeColors = Object.entries(playerProfiles)
-              .filter(([_, p]) => p.isActive)
+              .filter(([_, p]) => (p as PlayerProfile).isActive)
               .map(([color]) => color);
               
           const newTokens = INITIAL_TOKENS.filter(t => activeColors.includes(t.color));
@@ -292,10 +361,11 @@ export default function App() {
           setGameState(prev => ({ 
               ...prev, 
               tokens: newTokens,
+              status: 'PLAYING',
               gameLog: ["Game Started! Good luck."] 
           }));
       }
-  }, [countDown, playerProfiles]);
+  }, [countDown, playerProfiles, isHost]);
 
   // --- Winning Logic ---
   const checkWinCondition = (tokens: Token[], player: PlayerColor) => {
@@ -306,7 +376,7 @@ export default function App() {
   };
 
   const handleWin = (winner: PlayerColor) => {
-      setGameState(prev => ({ ...prev, winner }));
+      setGameState(prev => ({ ...prev, winner, status: 'FINISHED' }));
       
       if (applauseRef.current) {
           applauseRef.current.currentTime = 0;
@@ -322,6 +392,7 @@ export default function App() {
   };
 
   const kickAllExceptMe = () => {
+      if (!isHost) return;
       setPlayerProfiles((prev: Record<PlayerColor, PlayerProfile>) => {
           const next = { ...prev };
           (Object.keys(next) as PlayerColor[]).forEach((key) => {
@@ -342,7 +413,6 @@ export default function App() {
   };
 
   const handleAdmitNextPlayers = () => {
-      // Reset Game for next batch
       setGameState({
         tokens: INITIAL_TOKENS,
         currentPlayer: PlayerColor.BLUE,
@@ -351,13 +421,13 @@ export default function App() {
         isMoving: false,
         gameLog: ["New players admitted!"],
         winner: null,
+        status: 'LOBBY',
+        captureEvent: null
       });
       setTurnStep('ROLL');
-      setGameLocked(false);
       setManualLock(false);
       setMenuOpen(false);
       
-      // Reset profiles for new game (activating them again for demo)
       setPlayerProfiles((prev: Record<PlayerColor, PlayerProfile>) => {
           const next = { ...prev };
           (Object.keys(next) as PlayerColor[]).forEach((k) => {
@@ -390,9 +460,17 @@ export default function App() {
 
   // --- Handlers ---
   const handleRollDice = (forceSystem = false) => {
+    // If Guest, send Request to Host
+    if (!isHost) {
+        if (gameState.currentPlayer === myColor && connectionRef.current?.open) {
+            connectionRef.current.send({ type: 'ROLL' });
+        }
+        return;
+    }
+
     if (!forceSystem && gameState.currentPlayer !== myColor) return;
     if (gameState.winner) return;
-    if (!gameLocked) return; 
+    if (gameState.status !== 'PLAYING') return; 
 
     if (gameState.isRolling || gameState.isMoving) return;
     
@@ -454,6 +532,17 @@ export default function App() {
   };
 
   const handleTokenClick = async (tokenId: string, forceSystem = false) => {
+    // If Guest, send Request to Host
+    if (!isHost) {
+        if (gameState.currentPlayer === myColor && connectionRef.current?.open) {
+             const token = gameState.tokens.find(t => t.id === tokenId);
+             if (token && token.color === myColor) {
+                 connectionRef.current.send({ type: 'MOVE', tokenId });
+             }
+        }
+        return;
+    }
+
     if (gameState.winner) return;
     const token = gameState.tokens.find(t => t.id === tokenId);
     if (!token) return;
@@ -500,6 +589,7 @@ export default function App() {
     let captureOccurred = false;
     let captureLog = "";
     let opponentToResetId: string | null = null;
+    let newCaptureEvent = null;
 
     if (finalPos <= 50) {
         const currentOffset = START_OFFSETS[token.color];
@@ -518,10 +608,18 @@ export default function App() {
                 opponentToResetId = opponentToken.id;
                 captureOccurred = true;
                 captureLog = ` Captured ${opponentToken.color}!`;
-                setCaptureEvent({ globalIndex });
-                setTimeout(() => setCaptureEvent(null), 1500);
+                newCaptureEvent = { globalIndex };
             }
         }
+    }
+
+    // Set Capture event in State to broadcast it
+    if (newCaptureEvent) {
+         setGameState(prev => ({ ...prev, captureEvent: newCaptureEvent }));
+         // Clear it shortly after so it doesn't persist
+         setTimeout(() => {
+             setGameState(prev => ({ ...prev, captureEvent: null }));
+         }, 1500);
     }
 
     let finalTokenList = gameState.tokens.map(t => {
@@ -550,11 +648,10 @@ export default function App() {
   };
 
   const handleCopyLink = () => {
-    if (gameLocked || manualLock) return; 
-    
-    // Generate Invite Link with ?mode=guest
+    // Generate Invite Link with ?hostId=PEER_ID
     const url = new URL(window.location.href);
-    url.searchParams.set('mode', 'guest');
+    url.searchParams.delete('mode');
+    url.searchParams.set('hostId', peerId);
     
     navigator.clipboard.writeText(url.toString());
     setLinkCopied(true);
@@ -571,13 +668,21 @@ export default function App() {
 
   const handleProfileUpdate = (color: PlayerColor, field: 'name' | 'flag', value: string) => {
     if (color !== myColor) return;
-    setPlayerProfiles(prev => ({
-      ...prev,
-      [color]: { ...prev[color], [field]: value }
-    }));
+    setPlayerProfiles(prev => {
+        const newState = {
+            ...prev,
+            [color]: { ...prev[color], [field]: value }
+        };
+        // If Guest, send update to Host
+        if (!isHost && connectionRef.current?.open) {
+            connectionRef.current.send({ type: 'UPDATE_PROFILE', color, updates: { [field]: value } });
+        }
+        return newState;
+    });
   };
   
   const kickPlayer = (color: PlayerColor) => {
+      if (!isHost) return;
       setPlayerProfiles(prev => ({
           ...prev,
           [color]: { ...prev[color], isActive: false }
@@ -603,8 +708,11 @@ export default function App() {
 
   // --- Main Timer Logic (Roll & Move) ---
   useEffect(() => {
+      // Guest does not run timer logic, only Host
+      if (!isHost) return;
+
       let interval: any;
-      if (gameLocked && !gameState.winner && !gameState.isMoving && !gameState.isRolling) {
+      if (gameState.status === 'PLAYING' && !gameState.winner && !gameState.isMoving && !gameState.isRolling) {
           // Timer active during both ROLL and MOVE steps
           if (moveTimer > 0) {
               interval = setInterval(() => {
@@ -612,16 +720,16 @@ export default function App() {
               }, 1000);
           } else {
               // Timer Reached 0
-              if (gameState.currentPlayer === myColor) {
-                  // Action for "Me"
+              if (gameState.currentPlayer === myColor || playerProfiles[gameState.currentPlayer].isRemote) {
+                  // Action for "Me" or "Remote Player" (Auto-roll/move if timeout)
                   if (turnStep === 'ROLL') {
-                      handleRollDice(); // Auto roll
+                      handleRollDice(true); // Auto roll
                   } else if (turnStep === 'MOVE') {
                       if (selectableTokens.length > 0) {
                           const bestToken = gameState.tokens
                                   .filter(t => selectableTokens.includes(t.id))
                                   .sort((a,b) => b.position - a.position)[0];
-                          if(bestToken) handleTokenClick(bestToken.id);
+                          if(bestToken) handleTokenClick(bestToken.id, true);
                       } else {
                           finishTurn(gameState.tokens, "Time's up!", false);
                       }
@@ -631,10 +739,9 @@ export default function App() {
           }
       }
       return () => clearInterval(interval);
-  }, [turnStep, moveTimer, selectableTokens, gameState.currentPlayer, myColor, gameState.winner, gameLocked, gameState.isMoving, gameState.isRolling]);
+  }, [turnStep, moveTimer, selectableTokens, gameState.currentPlayer, myColor, gameState.winner, gameState.status, gameState.isMoving, gameState.isRolling, isHost, playerProfiles]);
 
-  // --- Queue Screen Component (Simulated) ---
-  // If we are in "Queue Mode" (e.g. if this was a separate user trying to join a locked game)
+  // --- Queue Screen Component ---
   if (isQueueMode) {
       return (
           <div className="min-h-screen bg-black flex flex-col items-center justify-center p-4">
@@ -655,8 +762,7 @@ export default function App() {
                       <div className="text-green-400 font-mono text-xl animate-pulse">Position Reserved</div>
                       <p className="text-slate-500 text-sm">Please wait for the current game to finish.</p>
                       
-                      {/* Simulated: If Host clicks "Next Players", this would unlock */}
-                      {!gameLocked && (
+                      {gameState.status === 'LOBBY' && (
                           <div className="mt-8 flex flex-col items-center animate-bounce">
                              <p className="text-yellow-400 font-bold mb-2">You're Up!</p>
                              <button 
@@ -716,6 +822,17 @@ export default function App() {
                 <Trophy className="text-yellow-500 w-5 h-5" />
                 <span className="font-bold text-white">Ludo Master</span>
              </div>
+             {/* Connection Status Indicator */}
+             <div className="flex items-center gap-1 ml-2">
+                 {isHost ? (
+                     <div className="flex items-center gap-1 bg-slate-700 px-2 py-1 rounded-md">
+                         <Users size={12} className="text-slate-300"/>
+                         <span className="text-xs text-slate-300">{connectionsRef.current.length}</span>
+                     </div>
+                 ) : (
+                     <div className={`w-2 h-2 rounded-full ${peerId ? 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.8)]' : 'bg-red-500'}`}></div>
+                 )}
+             </div>
           </div>
           
           {/* Menu Button - ONLY VISIBLE TO HOST */}
@@ -734,7 +851,7 @@ export default function App() {
                         <button onClick={() => setMenuOpen(false)} className="text-slate-400 hover:text-white"><X size={16}/></button>
                     </div>
 
-                    {!gameLocked && (
+                    {gameState.status === 'LOBBY' && (
                         <button 
                             onClick={handleStartGame}
                             className="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-3 rounded-lg flex items-center justify-center gap-2 shadow-lg mb-2"
@@ -756,14 +873,6 @@ export default function App() {
                             <div className={`w-8 h-4 rounded-full relative transition-colors ${manualLock ? 'bg-red-500' : 'bg-slate-500'}`}>
                                 <div className={`absolute top-0.5 w-3 h-3 bg-white rounded-full transition-all ${manualLock ? 'left-4.5' : 'left-0.5'}`}></div>
                             </div>
-                        </button>
-
-                        {/* Test Queue View Button (For Demo purposes) */}
-                        <button 
-                             onClick={() => setIsQueueMode(true)}
-                             className="w-full text-left text-xs text-slate-500 hover:text-white p-1"
-                        >
-                            (Debug: View Queue Screen)
                         </button>
                         
                         {gameState.winner && (
@@ -791,6 +900,7 @@ export default function App() {
                                         <div className="w-2 h-2 rounded-full shadow-sm" style={{backgroundColor: COLORS[c].main}}></div>
                                         <span className={`font-medium ${c === myColor ? 'text-white' : 'text-slate-400'}`}>
                                             {p.name} {c === myColor ? '(You)' : ''}
+                                            {p.isRemote && !p.isBot && <span className="ml-1 text-[10px] bg-blue-900 text-blue-300 px-1 rounded">NET</span>}
                                         </span>
                                      </div>
                                      {c !== myColor && (
@@ -812,13 +922,13 @@ export default function App() {
                     
                     <button 
                         onClick={handleCopyLink}
-                        disabled={manualLock || gameLocked}
+                        disabled={!peerId}
                         className={`flex items-center justify-between p-2 rounded-lg text-sm transition-colors mt-2
-                        ${(manualLock || gameLocked) ? 'bg-slate-700 text-slate-500 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-500 text-white'}
+                        ${(!peerId) ? 'bg-slate-700 text-slate-500 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-500 text-white'}
                         `}
                     >
                         <span className="flex items-center gap-2"><LinkIcon size={14}/> Invite Friend</span>
-                        {!(manualLock || gameLocked) && (linkCopied ? <Check size={14}/> : <Copy size={14}/>)}
+                        {peerId && (linkCopied ? <Check size={14}/> : <Copy size={14}/>)}
                     </button>
                     
                     <div className="bg-slate-900 rounded-lg p-2 border border-slate-700 mt-2">
@@ -870,7 +980,7 @@ export default function App() {
            positionClass="bottom-[5%] right-[5%] md:bottom-[10%] md:right-[10%]"
        />
 
-       {/* Board Container - No Blur when locked, No waiting text */}
+       {/* Board Container */}
        <div className={`relative w-[80vmin] h-[80vmin] max-w-[600px] max-h-[600px] transition-all duration-1000`}>
           <LudoBoard 
             tokens={gameState.tokens}
@@ -883,7 +993,7 @@ export default function App() {
             turnStep={turnStep}
             moveTimer={moveTimer}
             customDiceSound={customDiceSound}
-            captureEvent={captureEvent}
+            captureEvent={gameState.captureEvent}
           />
        </div>
        

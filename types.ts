@@ -1,4 +1,5 @@
 
+
 export enum PlayerColor {
   BLUE = 'blue',
   RED = 'red',
@@ -21,6 +22,8 @@ export interface GameState {
   isMoving: boolean; // New state to lock UI during jump animation
   gameLog: string[];
   winner: PlayerColor | null; // Track who won
+  status: 'LOBBY' | 'PLAYING' | 'FINISHED'; // Game status for sync
+  captureEvent: { globalIndex: number } | null; // Sync capture animations
 }
 
 export interface PlayerProfile {
@@ -28,6 +31,7 @@ export interface PlayerProfile {
   flag: string | null; // URL to the image
   isActive: boolean; // If false, player is kicked/removed
   isBot: boolean; // To simulate other players in this local-only version
+  isRemote?: boolean; // If true, controlled by a remote peer
 }
 
 export interface ChatMessage {
