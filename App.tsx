@@ -480,28 +480,34 @@ export default function App() {
     
     setGameState(prev => ({ ...prev, isRolling: true }));
 
+    // Capture state for use inside timeout
+    const currentPlayer = gameState.currentPlayer;
+
     setTimeout(() => {
       const newValue = Math.floor(Math.random() * 6) + 1;
-      const newLog = [...gameState.gameLog.slice(-4), `${playerProfiles[gameState.currentPlayer].name} rolled a ${newValue}`];
+      const newLog = [...gameStateRef.current.gameLog.slice(-4), `${playerProfilesRef.current[currentPlayer].name} rolled a ${newValue}`];
+      
+      // Update state with result
+      setGameState(prev => ({
+          ...prev,
+          isRolling: false,
+          diceValue: newValue,
+          gameLog: newLog
+      }));
 
-      setGameState(prev => {
-        return {
-            ...prev,
-            isRolling: false,
-            diceValue: newValue,
-            gameLog: newLog
-        };
-      });
-
-      const canMove = hasValidMoves(gameState.currentPlayer, newValue, gameState.tokens);
+      // Calculate logic based on result
+      const canMove = hasValidMoves(currentPlayer, newValue, gameStateRef.current.tokens);
 
       if (canMove) {
+          // Valid move exists: Give time to move
           setTurnStep('MOVE');
-          setMoveTimer(15); 
+          setMoveTimer(15); // Explicitly reset timer for MOVE phase
       } else {
-          setTurnStep('MOVE'); // Technically waiting for timeout to auto-pass
+          // No moves: Show MOVE state briefly then pass turn
+          setTurnStep('MOVE'); 
+          // Auto-pass after delay
           setTimeout(() => {
-              finishTurn(gameState.tokens, `No valid moves for ${playerProfiles[gameState.currentPlayer].name}.`, false);
+              finishTurn(gameStateRef.current.tokens, `No valid moves for ${playerProfilesRef.current[currentPlayer].name}.`, false);
           }, 1500); 
       }
     }, 800);
@@ -532,7 +538,7 @@ export default function App() {
               do {
                   nextIdx = (nextIdx + 1) % 4;
                   loops++;
-              } while (!playerProfiles[order[nextIdx]].isActive && loops < 4);
+              } while (!playerProfilesRef.current[order[nextIdx]].isActive && loops < 4);
               
               if (loops >= 4) return prev; // Should not happen if game is running
               nextPlayer = order[nextIdx];
@@ -549,7 +555,7 @@ export default function App() {
       });
       
       setTurnStep('ROLL');
-      setMoveTimer(15); // Force reset timer
+      setMoveTimer(15); // Force reset timer for next player's ROLL
   };
 
   const handleTokenClick = async (tokenId: string, forceSystemInput: boolean = false, requestingColor?: PlayerColor) => {
@@ -711,6 +717,8 @@ export default function App() {
   
   const kickPlayer = (color: PlayerColor) => {
       if (!isHost) return;
+      
+      // 1. Terminate Connection
       const connectionInfo = connectionsRef.current.find(c => c.color === color);
       if (connectionInfo) {
           connectionInfo.conn.send({ type: 'KICKED' });
@@ -718,77 +726,75 @@ export default function App() {
           connectionsRef.current = connectionsRef.current.filter(c => c.color !== color);
       }
 
-      setPlayerProfiles(prev => ({
-          ...prev,
-          [color]: { ...prev[color], isActive: false, isRemote: false, name: 'Empty', flag: null }
-      }));
-
-      // Remove player's tokens from the board
-      setGameState(prev => {
-          const newTokens = prev.tokens.filter(t => t.color !== color);
-          
-          let nextPlayer = prev.currentPlayer;
-          let diceValue = prev.diceValue;
-          let isRolling = prev.isRolling;
-          let turnStepVal = turnStep;
-          let timerVal = moveTimer;
-
-          // If it was the kicked player's turn, force move to next player
-          if (prev.currentPlayer === color) {
-              const order = [PlayerColor.BLUE, PlayerColor.RED, PlayerColor.GREEN, PlayerColor.YELLOW];
-              let nextIdx = order.indexOf(prev.currentPlayer);
-              let loops = 0;
-              // We need to look at FUTURE profiles (where kicked player is inactive)
-              // But setPlayerProfiles is async. We assume the kick makes them inactive.
-              // We search for the next Active player (skipping the one we just kicked)
-              
-              // Helper to find next active in current profiles, excluding 'color'
-              const findNext = (startIdx: number) => {
-                  let i = startIdx;
-                  let found = null;
-                  let attempt = 0;
-                  while(attempt < 4) {
-                      i = (i + 1) % 4;
-                      const c = order[i];
-                      const p = playerProfilesRef.current[c];
-                      // Active check: Use Ref for other players, but 'color' is definitely inactive now
-                      const isActive = (c !== color) && p.isActive;
-                      if (isActive) {
-                          found = c;
-                          break;
-                      }
-                      attempt++;
-                  }
-                  return found;
-              };
-
-              const foundNext = findNext(nextIdx);
-              if (foundNext) {
-                  nextPlayer = foundNext;
-                  diceValue = null;
-                  isRolling = false;
-                  turnStepVal = 'ROLL';
-                  timerVal = 15;
-              }
-          }
-
-          // Immediate Sync state with updated tokens and potentially new player
-          const newGS = {
+      // 2. Prepare Updates
+      setPlayerProfiles(prev => {
+          const updatedProfiles = {
               ...prev,
-              tokens: newTokens,
-              currentPlayer: nextPlayer,
-              diceValue: diceValue,
-              isRolling: isRolling
+              [color]: { ...prev[color], isActive: false, isRemote: false, name: 'Empty', flag: null }
           };
 
-          // Broadcast explicitly because multiple states changed
-          setTimeout(() => {
-             setTurnStep(turnStepVal as any);
-             setMoveTimer(timerVal);
-             broadcastState({ gs: newGS, step: turnStepVal, timer: timerVal });
-          }, 50);
+          setGameState(prevGS => {
+              // 3. REMOVE TOKENS COMPLETELY
+              const newTokens = prevGS.tokens.filter(t => t.color !== color);
+              
+              let nextPlayer = prevGS.currentPlayer;
+              let diceValue = prevGS.diceValue;
+              let isRolling = prevGS.isRolling;
+              let turnStepVal = turnStep;
+              let moveTimerVal = moveTimer;
 
-          return newGS;
+              // 4. If it was the kicked player's turn, pass it immediately
+              if (prevGS.currentPlayer === color) {
+                  const order = [PlayerColor.BLUE, PlayerColor.RED, PlayerColor.GREEN, PlayerColor.YELLOW];
+                  let nextIdx = order.indexOf(prevGS.currentPlayer);
+                  let attempts = 0;
+                  let foundNext = null;
+
+                  // Find next active player (excluding the one we just made inactive)
+                  while(attempts < 4) {
+                      nextIdx = (nextIdx + 1) % 4;
+                      const c = order[nextIdx];
+                      // Use updatedProfiles for the kicked player check, refs for others
+                      if (updatedProfiles[c].isActive) {
+                          foundNext = c;
+                          break;
+                      }
+                      attempts++;
+                  }
+
+                  if (foundNext) {
+                      nextPlayer = foundNext;
+                      diceValue = null;
+                      isRolling = false;
+                      turnStepVal = 'ROLL';
+                      moveTimerVal = 15;
+                  }
+              }
+
+              const newGS = {
+                  ...prevGS,
+                  tokens: newTokens,
+                  currentPlayer: nextPlayer,
+                  diceValue: diceValue,
+                  isRolling: isRolling
+              };
+
+              // 5. FORCE IMMEDIATE BROADCAST
+              setTimeout(() => {
+                  setTurnStep(turnStepVal as any);
+                  setMoveTimer(moveTimerVal);
+                  broadcastState({ 
+                      gs: newGS, 
+                      profiles: updatedProfiles, 
+                      step: turnStepVal, 
+                      timer: moveTimerVal 
+                  });
+              }, 50);
+
+              return newGS;
+          });
+
+          return updatedProfiles;
       });
   };
 
@@ -854,17 +860,26 @@ export default function App() {
                   setMoveTimer(prev => prev - 1);
               }, 1000);
           } else {
-              // Timer Reached 0 - Auto Turn
-              // Only trigger if we are strictly in a state that allows it
+              // Timer Reached 0 - Auto Turn Logic
               if (turnStep === 'ROLL') {
+                  // Time to Roll - Trigger Roll
                   handleRollDice(true); 
               } else if (turnStep === 'MOVE') {
+                  // Time to Move - Trigger Auto Move
                   if (selectableTokens.length > 0) {
+                      // Find best token: Furthest ahead (highest position)
                       const bestToken = gameState.tokens
                               .filter(t => selectableTokens.includes(t.id))
                               .sort((a,b) => b.position - a.position)[0];
-                      if(bestToken) handleTokenClick(bestToken.id, true);
+                              
+                      if(bestToken) {
+                          handleTokenClick(bestToken.id, true);
+                      } else {
+                          // Should not happen if selectableTokens > 0
+                          finishTurn(gameState.tokens, "Time's up! Skipped.", false);
+                      }
                   } else {
+                      // No moves possible? Just pass turn.
                       finishTurn(gameState.tokens, "Time's up!", false);
                   }
               }
