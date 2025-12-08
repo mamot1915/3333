@@ -505,6 +505,13 @@ export default function App() {
       } else {
           // No moves: Show MOVE state briefly then pass turn
           setTurnStep('MOVE'); 
+          
+          // CRITICAL FIX:
+          // We set isMoving to true to blocking user interaction AND to pause the host Timer effect.
+          // This prevents the Timer (which might be 0 from auto-roll) from triggering "Time's Up" 
+          // logic while we are simply showing the "No Move" delay.
+          setGameState(prev => ({ ...prev, isMoving: true })); 
+          
           // Auto-pass after delay
           setTimeout(() => {
               finishTurn(gameStateRef.current.tokens, `No valid moves for ${playerProfilesRef.current[currentPlayer].name}.`, false);
@@ -554,8 +561,9 @@ export default function App() {
           };
       });
       
+      // Reset flow control for next player
       setTurnStep('ROLL');
-      setMoveTimer(15); // Force reset timer for next player's ROLL
+      setMoveTimer(15); 
   };
 
   const handleTokenClick = async (tokenId: string, forceSystemInput: boolean = false, requestingColor?: PlayerColor) => {
@@ -735,6 +743,7 @@ export default function App() {
 
           setGameState(prevGS => {
               // 3. REMOVE TOKENS COMPLETELY
+              // This ensures the kicked player's tokens disappear from the board
               const newTokens = prevGS.tokens.filter(t => t.color !== color);
               
               let nextPlayer = prevGS.currentPlayer;
