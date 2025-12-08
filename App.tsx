@@ -3,7 +3,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { LudoBoard } from './components/LudoBoard';
 import { PlayerColor, GameState, Token, PlayerProfile } from './types';
 import { INITIAL_TOKENS, COLORS, START_OFFSETS, SAFE_SPOTS } from './constants';
-import { Trophy, Menu, X, Link as LinkIcon, Copy, Check, Upload, Music, Globe, Users, Play, Ban, Lock, Unlock, UserPlus, Zap } from 'lucide-react';
+import { Trophy, Menu, X, Link as LinkIcon, Copy, Check, Upload, Music, Globe, Users, Play, Ban, Lock, Unlock, UserPlus, Zap, Loader2, AlertCircle } from 'lucide-react';
 
 declare var Peer: any;
 
@@ -176,7 +176,11 @@ export default function App() {
   const connectionsRef = useRef<{ conn: any, color: PlayerColor }[]>([]); 
   const connectionRef = useRef<any>(null); // For Guest
 
-  const [myColor, setMyColor] = useState<PlayerColor>(isHost ? PlayerColor.RED : PlayerColor.BLUE);
+  // Guests start with null color until assigned by Host
+  const [myColor, setMyColor] = useState<PlayerColor | null>(isHost ? PlayerColor.RED : null);
+  
+  // Join Status for Guests
+  const [joinStatus, setJoinStatus] = useState<'INIT' | 'JOINING' | 'JOINED' | 'FULL'>('INIT');
 
   // Game State
   const [gameState, setGameState] = useState<GameState>({
@@ -217,9 +221,14 @@ export default function App() {
   // Timer State
   const [moveTimer, setMoveTimer] = useState(15);
   
-  // Queue System
-  const [isQueueMode, setIsQueueMode] = useState(false); 
-  const [queueSpotTaken, setQueueSpotTaken] = useState(false);
+  // Refs for checking state inside PeerJS closures (CRITICAL FIX)
+  const gameStateRef = useRef(gameState);
+  const playerProfilesRef = useRef(playerProfiles);
+
+  useEffect(() => {
+      gameStateRef.current = gameState;
+      playerProfilesRef.current = playerProfiles;
+  }, [gameState, playerProfiles]);
 
   // --- PeerJS Logic ---
   useEffect(() => {
@@ -229,10 +238,12 @@ export default function App() {
       setPeerId(id);
       
       if (!isHost && hostId) {
+        setJoinStatus('JOINING');
         // I am Guest, connect to Host
         const conn = peer.connect(hostId);
         connectionRef.current = conn;
 
+        // Ensure connection is established before sending JOIN
         conn.on('open', () => {
           conn.send({ type: 'JOIN' });
         });
@@ -242,13 +253,19 @@ export default function App() {
              setGameState(data.payload.gameState);
              setPlayerProfiles(data.payload.playerProfiles);
              if (data.payload.turnStep) setTurnStep(data.payload.turnStep);
-             // Sync Timer
              if (typeof data.payload.moveTimer === 'number') setMoveTimer(data.payload.moveTimer);
           } else if (data.type === 'WELCOME') {
              setMyColor(data.color);
+             setJoinStatus('JOINED');
           } else if (data.type === 'ERROR') {
-             alert(data.message);
+             setJoinStatus('FULL');
+             conn.close();
           }
+        });
+        
+        conn.on('error', (err: any) => {
+            console.error("Connection Error", err);
+            setJoinStatus('FULL'); // Treat connection errors as inability to join
         });
       }
     });
@@ -257,14 +274,25 @@ export default function App() {
       peer.on('connection', (conn: any) => {
         conn.on('open', () => {
            // Assign a unique color to this connection
+           const currentProfiles = playerProfilesRef.current;
+           const currentGS = gameStateRef.current;
+
+           // If game already started, reject new players
+           if (currentGS.status !== 'LOBBY') {
+               conn.send({ type: 'ERROR', message: 'Game already in progress' });
+               setTimeout(() => conn.close(), 500);
+               return;
+           }
+
            const assignedColors = [PlayerColor.RED, ...connectionsRef.current.map(c => c.color)];
-           const allColors = [PlayerColor.BLUE, PlayerColor.GREEN, PlayerColor.YELLOW]; // Preference order
+           const allColors = [PlayerColor.BLUE, PlayerColor.GREEN, PlayerColor.YELLOW]; 
            const nextColor = allColors.find(c => !assignedColors.includes(c));
 
            if (nextColor) {
                // Successful Join
                connectionsRef.current.push({ conn, color: nextColor });
                
+               // Update profiles locally using functional update to trigger re-render
                setPlayerProfiles(prev => {
                    const newProfiles = { ...prev };
                    newProfiles[nextColor] = { 
@@ -276,12 +304,29 @@ export default function App() {
                    
                    // Sync immediately with new profile
                    conn.send({ type: 'WELCOME', color: nextColor });
-                   broadcastState({ profiles: newProfiles });
+                   
+                   // Broadcast to all (including the new one via sync)
+                   // We use a timeout to let state settle or just pass new object
+                   setTimeout(() => {
+                       const payload = { 
+                          type: 'SYNC', 
+                          payload: { 
+                              gameState: gameStateRef.current, 
+                              playerProfiles: newProfiles, 
+                              turnStep: 'ROLL', 
+                              moveTimer: 15 
+                          } 
+                       };
+                       connectionsRef.current.forEach(c => {
+                           if (c.conn.open) c.conn.send(payload);
+                       });
+                   }, 100);
+
                    return newProfiles;
                });
            } else {
                // Room Full
-               conn.send({ type: 'ERROR', message: 'Room is full (4 players max)' });
+               conn.send({ type: 'ERROR', message: 'Room is full' });
                setTimeout(() => conn.close(), 500);
            }
         });
@@ -292,20 +337,18 @@ export default function App() {
            if (!sender) return;
 
            const senderColor = sender.color;
+           // CRITICAL: Use Refs for validation to avoid stale state in closure
+           const currentGS = gameStateRef.current; 
 
            if (data.type === 'ROLL') {
                // Only allow if it's their turn
-               setGameState(current => {
-                   if (current.currentPlayer === senderColor && !current.isRolling && !current.diceValue) {
-                       // We can't update state inside callback like this safely for complex logic, 
-                       // so we trigger the handler via effect or direct call.
-                       // For simplicity, we'll allow the effect loop or handleRollDice to check validity.
-                       handleRollDice(true, senderColor); 
-                   }
-                   return current;
-               });
+               if (currentGS.currentPlayer === senderColor && !currentGS.isRolling && !currentGS.diceValue) {
+                   handleRollDice(true, senderColor); 
+               }
            } else if (data.type === 'MOVE') {
-               handleTokenClick(data.tokenId, true, senderColor);
+               if (currentGS.currentPlayer === senderColor) {
+                   handleTokenClick(data.tokenId, true, senderColor);
+               }
            } else if (data.type === 'UPDATE_PROFILE') {
                setPlayerProfiles(prev => ({
                    ...prev,
@@ -359,30 +402,10 @@ export default function App() {
     applauseRef.current = new Audio("https://actions.google.com/sounds/v1/crowds/applause_large_crowd.ogg");
   }, []);
 
-  // --- Strict Identity & Bot Logic ---
-  useEffect(() => {
-    if (!isHost) return;
-
-    if (gameState.status === 'PLAYING' && gameState.winner === null) {
-        const currentPlayerProfile = playerProfiles[gameState.currentPlayer];
-        
-        // Host (Red) Auto-actions only if Host is AFK? No, we don't auto-play for Host unless 'isBot' is true.
-        // Currently Host is always human (isBot: false).
-
-        // Bot Logic for unfilled slots that might have been left as bots (optional, but requested behavior is "remove them")
-        // The requested behavior is: "If less than 4 players, remove the others". 
-        // So effectively, there are NO bots in this version.
-        
-        // Skip logic for inactive players is handled in finishTurn.
-    }
-  }, [gameState, turnStep, playerProfiles, isHost]);
-
   // --- Start Game Logic ---
   const handleStartGame = () => {
       setMenuOpen(false);
       setCountDown(10);
-      
-      // Update profiles immediately to show host initiated countdown
       setGameState(prev => ({ ...prev, gameLog: [...prev.gameLog, "Host started countdown..."] }));
   };
 
@@ -397,10 +420,6 @@ export default function App() {
 
           setCountDown(null);
           setManualLock(true); 
-          
-          // Determine who is actually playing
-          // Red is Host (always active)
-          // Others are active ONLY if isRemote is true (meaning a human is connected)
           
           setPlayerProfiles(prevProfiles => {
               const newProfiles = { ...prevProfiles };
@@ -421,18 +440,22 @@ export default function App() {
                   }
               });
 
-              // Filter tokens to only include active players
+              // If fewer than 2 players, maybe keep bots? 
+              // User requirement: "If yellow has no player, remove yellow". 
+              // Implies we only play with active humans + Host.
+              
               const newTokens = INITIAL_TOKENS.filter(t => activeColors.includes(t.color));
               
               const newGameState = { 
                   ...gameState, 
                   tokens: newTokens,
-                  status: 'PLAYING' as const, // Explicit cast
+                  status: 'PLAYING' as const, 
                   gameLog: ["Game Started!"] 
               };
 
               setGameState(newGameState);
-              broadcastState({ gs: newGameState, profiles: newProfiles });
+              // Broadcast happens automatically via effect, but for critical transition we can force it
+              // broadcastState({ gs: newGameState, profiles: newProfiles });
               
               return newProfiles;
           });
@@ -472,16 +495,13 @@ export default function App() {
       setManualLock(false);
       setMenuOpen(false);
       
-      // Reset all slots to waiting
       setPlayerProfiles(prev => {
           const next = { ...prev };
           (Object.keys(next) as PlayerColor[]).forEach((k) => {
-              // Keep remote connections, just reset status logic if needed
-              // Actually we want to keep connected players
               if (k === PlayerColor.RED || next[k].isRemote) {
                   next[k].isActive = true;
               } else {
-                  next[k].isActive = true; // Open lobby back up visually
+                  next[k].isActive = true; 
               }
           });
           return next;
@@ -490,14 +510,17 @@ export default function App() {
 
   // --- Handlers ---
   const handleRollDice = (forceSystemInput: boolean = false, requestingColor?: PlayerColor) => {
+    // Note: We use gameStateRef for validation inside peer callbacks, but here we use current state
+    // for local checks.
+    
     // 1. Identification Check
     if (isHost) {
         // I am Host.
-        // If it's a forced system input (from network or timer), proceed.
         // If it's a manual click (forceSystemInput=false), ensure it is MY turn (Red).
         if (!forceSystemInput && gameState.currentPlayer !== PlayerColor.RED) return;
         
         // If network request, ensure the requester matches the current player
+        // Note: The logic in peer.on('data') already checks requestingColor vs Ref, so this is a double check.
         if (requestingColor && requestingColor !== gameState.currentPlayer) return;
     } else {
         // I am Guest.
@@ -505,42 +528,43 @@ export default function App() {
         if (gameState.currentPlayer === myColor && connectionRef.current?.open) {
             connectionRef.current.send({ type: 'ROLL' });
         }
-        return; // Client stops here, waits for sync
+        return; // Client stops here
     }
 
     if (gameState.winner) return;
     if (gameState.status !== 'PLAYING') return; 
     if (gameState.isRolling || gameState.isMoving) return;
-    if (gameState.diceValue !== null) return; // Already rolled
+    if (gameState.diceValue !== null) return; 
     
     setGameState(prev => ({ ...prev, isRolling: true }));
 
     setTimeout(() => {
       const newValue = Math.floor(Math.random() * 6) + 1;
+      // const newValue = 6; // Debugging
       const newLog = [...gameState.gameLog.slice(-4), `${playerProfiles[gameState.currentPlayer].name} rolled a ${newValue}`];
 
       setGameState(prev => {
-        const nextState = {
+        return {
             ...prev,
             isRolling: false,
             diceValue: newValue,
             gameLog: newLog
         };
-        
-        // Check moves immediately after state update (in next render cycle effectively, 
-        // but for Host logic we need to determine next step)
-        return nextState;
       });
 
-      // Logic to determine if move is possible needs the new value
+      // Note: We need to check moves against the NEW value.
+      // Since state update is async, we pass `newValue` directly to helper
       const canMove = hasValidMoves(gameState.currentPlayer, newValue, gameState.tokens);
 
       if (canMove) {
           setTurnStep('MOVE');
           setMoveTimer(15); 
       } else {
-          setTurnStep('MOVE'); // Still switch to MOVE phase to show "No moves"
+          setTurnStep('MOVE'); 
           setTimeout(() => {
+              // We need to pass the updated tokens (same as current in this case)
+              // But we need to be careful about state closure. 
+              // Using functional update in finishTurn is safer or passing current tokens.
               finishTurn(gameState.tokens, `No valid moves for ${playerProfiles[gameState.currentPlayer].name}.`, false);
           }, 1500); 
       }
@@ -557,37 +581,36 @@ export default function App() {
   };
 
   const finishTurn = (tokens: Token[], logMessage: string, rolledSix: boolean) => {
-      if (gameState.winner) return;
+      setGameState(prev => {
+          if (prev.winner) return prev;
 
-      let nextPlayer = gameState.currentPlayer;
-      let nextLogMsg = logMessage;
+          let nextPlayer = prev.currentPlayer;
+          let nextLogMsg = logMessage;
 
-      if (rolledSix) {
-          nextLogMsg += " Rolled 6! Bonus turn.";
-      } else {
-          const order = [PlayerColor.BLUE, PlayerColor.RED, PlayerColor.GREEN, PlayerColor.YELLOW];
-          let nextIdx = order.indexOf(gameState.currentPlayer);
-          let loops = 0;
-          do {
-              nextIdx = (nextIdx + 1) % 4;
-              loops++;
-          } while (!playerProfiles[order[nextIdx]].isActive && loops < 4);
-          
-          if (loops >= 4) {
-             // Everyone is inactive? (Shouldn't happen)
-             return;
+          if (rolledSix) {
+              nextLogMsg += " Rolled 6! Bonus turn.";
+          } else {
+              const order = [PlayerColor.BLUE, PlayerColor.RED, PlayerColor.GREEN, PlayerColor.YELLOW];
+              let nextIdx = order.indexOf(prev.currentPlayer);
+              let loops = 0;
+              do {
+                  nextIdx = (nextIdx + 1) % 4;
+                  loops++;
+              } while (!playerProfiles[order[nextIdx]].isActive && loops < 4);
+              
+              if (loops >= 4) return prev;
+              nextPlayer = order[nextIdx];
           }
-          nextPlayer = order[nextIdx];
-      }
 
-      setGameState(prev => ({
-          ...prev,
-          tokens: tokens,
-          currentPlayer: nextPlayer,
-          isMoving: false, 
-          gameLog: [...prev.gameLog, nextLogMsg],
-          diceValue: null
-      }));
+          return {
+              ...prev,
+              tokens: tokens,
+              currentPlayer: nextPlayer,
+              isMoving: false, 
+              gameLog: [...prev.gameLog, nextLogMsg],
+              diceValue: null
+          };
+      });
       
       setTurnStep('ROLL');
       setMoveTimer(15); 
@@ -596,12 +619,9 @@ export default function App() {
   const handleTokenClick = async (tokenId: string, forceSystemInput: boolean = false, requestingColor?: PlayerColor) => {
     // 1. Identification Check
     if (isHost) {
-        // If manual click, must be Red
         if (!forceSystemInput && gameState.currentPlayer !== PlayerColor.RED) return;
-        // If network request, must be from current player
         if (requestingColor && requestingColor !== gameState.currentPlayer) return;
     } else {
-        // Guest: Request Move
         if (gameState.currentPlayer === myColor && connectionRef.current?.open) {
              const token = gameState.tokens.find(t => t.id === tokenId);
              if (token && token.color === myColor) {
@@ -649,7 +669,6 @@ export default function App() {
          await new Promise(r => setTimeout(r, 250));
     }
 
-    // Determine final state after animation
     const finalPos = endPos; 
     let captureOccurred = false;
     let captureLog = "";
@@ -662,8 +681,17 @@ export default function App() {
         const isSafeSpot = SAFE_SPOTS.includes(globalIndex);
         
         if (!isSafeSpot) {
-            const opponentToken = gameState.tokens.find(t => {
-               if (t.color === gameState.currentPlayer || t.position === -1 || t.position > 50) return false;
+            // Need current tokens to check collision
+            // We can rely on ref or just map current state in setter? 
+            // Better to grab latest from state updater to be safe, but complex logic here.
+            // We'll use gameStateRef.current.tokens BUT updated with current move. 
+            // Actually strictly speaking we should use the tokens from the last step of animation loop.
+            const currentTokens = gameStateRef.current.tokens; // This is theoretically 'live' if sync is fast, but animation loop sets state locally.
+            // Safer to just use the token list we are building.
+            
+            // Re-find opponent in the list we are about to commit
+            const opponentToken = gameStateRef.current.tokens.find(t => {
+               if (t.color === token.color || t.position === -1 || t.position > 50) return false;
                const oppOffset = START_OFFSETS[t.color];
                const oppGlobalIndex = (t.position + oppOffset) % 52;
                return oppGlobalIndex === globalIndex;
@@ -685,7 +713,8 @@ export default function App() {
          }, 1500);
     }
 
-    let finalTokenList = gameState.tokens.map(t => {
+    // Apply final move
+    let finalTokenList = gameStateRef.current.tokens.map(t => {
         if (t.id === tokenId) return { ...t, position: finalPos }; 
         if (t.id === opponentToResetId) return { ...t, position: -1 };
         return t;
@@ -696,17 +725,24 @@ export default function App() {
     if (captureOccurred) logMsg += captureLog;
     if (finalPos === 56) logMsg += " Reached Home!";
 
-    checkWinCondition(finalTokenList, gameState.currentPlayer);
-
-    if (!gameState.winner) {
-        finishTurn(finalTokenList, logMsg, rolledSix);
-    } else {
+    // Check Win
+    const finishedCount = finalTokenList.filter(t => t.color === gameState.currentPlayer && t.position === 56).length;
+    
+    if (finishedCount === 4) {
          setGameState(prev => ({
           ...prev,
           tokens: finalTokenList,
           isMoving: false,
-          gameLog: [...prev.gameLog, logMsg]
-      }));
+          gameLog: [...prev.gameLog, logMsg],
+          winner: gameState.currentPlayer,
+          status: 'FINISHED'
+        }));
+        if (applauseRef.current) {
+          applauseRef.current.currentTime = 0;
+          applauseRef.current.play().catch(() => {});
+        }
+    } else {
+        finishTurn(finalTokenList, logMsg, rolledSix);
     }
   };
 
@@ -745,7 +781,6 @@ export default function App() {
   
   const kickPlayer = (color: PlayerColor) => {
       if (!isHost) return;
-      // Find connection with this color and close it
       const connectionInfo = connectionsRef.current.find(c => c.color === color);
       if (connectionInfo) {
           connectionInfo.conn.close();
@@ -771,9 +806,8 @@ export default function App() {
 
   const selectableTokens = getSelectableTokens();
 
-  // --- Main Timer Logic (Roll & Move) ---
+  // --- Main Timer Logic (Host Only) ---
   useEffect(() => {
-      // Guest does not run timer logic, only Host
       if (!isHost) return;
 
       let interval: any;
@@ -783,7 +817,7 @@ export default function App() {
                   setMoveTimer(prev => prev - 1);
               }, 1000);
           } else {
-              // Timer Reached 0 - Auto Turn Logic
+              // Timer Reached 0 - Auto Turn
               if (turnStep === 'ROLL') {
                   handleRollDice(true); // System auto-roll
               } else if (turnStep === 'MOVE') {
@@ -799,28 +833,28 @@ export default function App() {
           }
       }
       return () => clearInterval(interval);
-  }, [turnStep, moveTimer, selectableTokens, gameState.currentPlayer, myColor, gameState.winner, gameState.status, gameState.isMoving, gameState.isRolling, isHost]);
+  }, [turnStep, moveTimer, selectableTokens, gameState.currentPlayer, gameState.status, gameState.isMoving, gameState.isRolling, isHost]);
 
-  // --- Queue Screen Component (Guest View) ---
-  if (isQueueMode) {
+  // --- Full Room / Blocked Screen ---
+  if (joinStatus === 'FULL') {
       return (
-          <div className="min-h-screen bg-black flex flex-col items-center justify-center p-4">
-              <h1 className="text-white text-2xl font-bold mb-8">Waiting Queue</h1>
-              {!queueSpotTaken ? (
-                  <button 
-                      onClick={() => {
-                          setQueueSpotTaken(true);
-                      }}
-                      className="bg-green-600 hover:bg-green-500 text-white font-bold py-6 px-12 rounded-2xl text-xl shadow-[0_0_20px_rgba(34,197,94,0.6)] transition-all transform hover:scale-105"
-                  >
-                      JOIN QUEUE
-                  </button>
-              ) : (
-                  <div className="flex flex-col items-center gap-4">
-                      <div className="text-green-400 font-mono text-xl animate-pulse">Position Reserved</div>
-                      <p className="text-slate-500 text-sm">Please wait for the current game to finish.</p>
-                  </div>
-              )}
+          <div className="min-h-screen bg-slate-900 flex flex-col items-center justify-center p-6 text-center">
+              <AlertCircle size={64} className="text-red-500 mb-6" />
+              <h1 className="text-3xl font-black text-white mb-2">Room Full</h1>
+              <p className="text-slate-400 max-w-md text-lg">
+                  The game has already started or the lobby is full. Please wait for the next game.
+              </p>
+          </div>
+      );
+  }
+
+  // --- Waiting Room / Connecting Screen ---
+  if (!isHost && joinStatus !== 'JOINED') {
+      return (
+          <div className="min-h-screen bg-slate-900 flex flex-col items-center justify-center p-6">
+              <Loader2 size={48} className="text-blue-500 animate-spin mb-4" />
+              <h1 className="text-xl font-bold text-white">Connecting to Host...</h1>
+              <p className="text-slate-500 mt-2 text-sm">Waiting for assignment</p>
           </div>
       );
   }
@@ -874,7 +908,7 @@ export default function App() {
                          <span className="text-xs text-slate-300">{connectionsRef.current.length}</span>
                      </div>
                  ) : (
-                     <div className={`w-2 h-2 rounded-full ${peerId ? 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.8)]' : 'bg-red-500'}`}></div>
+                     <div className={`w-2 h-2 rounded-full ${joinStatus === 'JOINED' ? 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.8)]' : 'bg-red-500'}`}></div>
                  )}
              </div>
           </div>
