@@ -180,7 +180,7 @@ export default function App() {
   const [myColor, setMyColor] = useState<PlayerColor | null>(isHost ? PlayerColor.RED : null);
   
   // Join Status for Guests
-  const [joinStatus, setJoinStatus] = useState<'INIT' | 'JOINING' | 'JOINED' | 'FULL'>('INIT');
+  const [joinStatus, setJoinStatus] = useState<'INIT' | 'JOINING' | 'JOINED' | 'FULL' | 'KICKED'>('INIT');
 
   // Game State
   const [gameState, setGameState] = useState<GameState>({
@@ -230,6 +230,15 @@ export default function App() {
       playerProfilesRef.current = playerProfiles;
   }, [gameState, playerProfiles]);
 
+  // --- Handlers Ref Pattern ---
+  // This allows the PeerJS listeners (which are bound once) to always call the latest version 
+  // of these functions, preventing stale state issues.
+  const handlersRef = useRef({
+      handleRollDice: (f: boolean, c?: PlayerColor) => {},
+      handleTokenClick: (id: string, f: boolean, c?: PlayerColor) => {},
+      handleProfileUpdate: (c: PlayerColor, field: 'name' | 'flag', v: string) => {}
+  });
+
   // --- PeerJS Logic ---
   useEffect(() => {
     const peer = new Peer(undefined, { debug: 1 });
@@ -260,6 +269,9 @@ export default function App() {
           } else if (data.type === 'ERROR') {
              setJoinStatus('FULL');
              conn.close();
+          } else if (data.type === 'KICKED') {
+             setJoinStatus('KICKED');
+             conn.close();
           }
         });
         
@@ -274,7 +286,6 @@ export default function App() {
       peer.on('connection', (conn: any) => {
         conn.on('open', () => {
            // Assign a unique color to this connection
-           const currentProfiles = playerProfilesRef.current;
            const currentGS = gameStateRef.current;
 
            // If game already started, reject new players
@@ -305,21 +316,9 @@ export default function App() {
                    // Sync immediately with new profile
                    conn.send({ type: 'WELCOME', color: nextColor });
                    
-                   // Broadcast to all (including the new one via sync)
-                   // We use a timeout to let state settle or just pass new object
+                   // Broadcast update
                    setTimeout(() => {
-                       const payload = { 
-                          type: 'SYNC', 
-                          payload: { 
-                              gameState: gameStateRef.current, 
-                              playerProfiles: newProfiles, 
-                              turnStep: 'ROLL', 
-                              moveTimer: 15 
-                          } 
-                       };
-                       connectionsRef.current.forEach(c => {
-                           if (c.conn.open) c.conn.send(payload);
-                       });
+                       broadcastState({ profiles: newProfiles });
                    }, 100);
 
                    return newProfiles;
@@ -337,23 +336,14 @@ export default function App() {
            if (!sender) return;
 
            const senderColor = sender.color;
-           // CRITICAL: Use Refs for validation to avoid stale state in closure
-           const currentGS = gameStateRef.current; 
-
+           
+           // CRITICAL: Call the function from the ref to get the LATEST closure
            if (data.type === 'ROLL') {
-               // Only allow if it's their turn
-               if (currentGS.currentPlayer === senderColor && !currentGS.isRolling && !currentGS.diceValue) {
-                   handleRollDice(true, senderColor); 
-               }
+               handlersRef.current.handleRollDice(true, senderColor);
            } else if (data.type === 'MOVE') {
-               if (currentGS.currentPlayer === senderColor) {
-                   handleTokenClick(data.tokenId, true, senderColor);
-               }
+               handlersRef.current.handleTokenClick(data.tokenId, true, senderColor);
            } else if (data.type === 'UPDATE_PROFILE') {
-               setPlayerProfiles(prev => ({
-                   ...prev,
-                   [senderColor]: { ...prev[senderColor], ...data.updates }
-               }));
+               handlersRef.current.handleProfileUpdate(senderColor, Object.keys(data.updates)[0] as any, Object.values(data.updates)[0] as string);
            }
         });
         
@@ -391,6 +381,8 @@ export default function App() {
   };
 
   // Host: Broadcast State on Change
+  // We use this effect to catch "automatic" state changes (like animations ending),
+  // but for critical user actions (roll, move), we might also force broadcast in handlers.
   useEffect(() => {
       if (isHost) {
           broadcastState();
@@ -434,101 +426,51 @@ export default function App() {
                           newProfiles[color].isActive = true;
                           activeColors.push(color);
                       } else {
-                          // No player connected, remove this color from game
-                          newProfiles[color].isActive = false;
+                          newProfiles[color].isActive = false; // Remove empty slots
                       }
                   }
               });
 
-              // If fewer than 2 players, maybe keep bots? 
-              // User requirement: "If yellow has no player, remove yellow". 
-              // Implies we only play with active humans + Host.
-              
+              // Filter tokens to only include active players
               const newTokens = INITIAL_TOKENS.filter(t => activeColors.includes(t.color));
               
               const newGameState = { 
                   ...gameState, 
                   tokens: newTokens,
                   status: 'PLAYING' as const, 
-                  gameLog: ["Game Started!"] 
+                  gameLog: ["Game Started!"],
+                  diceValue: null
               };
 
               setGameState(newGameState);
-              // Broadcast happens automatically via effect, but for critical transition we can force it
-              // broadcastState({ gs: newGameState, profiles: newProfiles });
-              
+              setMoveTimer(15); // Reset timer for start
+              setTurnStep('ROLL');
               return newProfiles;
           });
       }
   }, [countDown, isHost]);
 
-  // --- Winning Logic ---
-  const checkWinCondition = (tokens: Token[], player: PlayerColor) => {
-      const finishedCount = tokens.filter(t => t.color === player && t.position === 56).length;
-      if (finishedCount === 4) {
-          handleWin(player);
-      }
-  };
-
-  const handleWin = (winner: PlayerColor) => {
-      setGameState(prev => ({ ...prev, winner, status: 'FINISHED' }));
-      
-      if (applauseRef.current) {
-          applauseRef.current.currentTime = 0;
-          applauseRef.current.play().catch(() => {});
-      }
-  };
-
-  const handleAdmitNextPlayers = () => {
-      setGameState({
-        tokens: INITIAL_TOKENS,
-        currentPlayer: PlayerColor.BLUE,
-        diceValue: null,
-        isRolling: false,
-        isMoving: false,
-        gameLog: ["New players admitted!"],
-        winner: null,
-        status: 'LOBBY',
-        captureEvent: null
-      });
-      setTurnStep('ROLL');
-      setManualLock(false);
-      setMenuOpen(false);
-      
-      setPlayerProfiles(prev => {
-          const next = { ...prev };
-          (Object.keys(next) as PlayerColor[]).forEach((k) => {
-              if (k === PlayerColor.RED || next[k].isRemote) {
-                  next[k].isActive = true;
-              } else {
-                  next[k].isActive = true; 
-              }
-          });
-          return next;
-      });
-  };
-
   // --- Handlers ---
   const handleRollDice = (forceSystemInput: boolean = false, requestingColor?: PlayerColor) => {
-    // Note: We use gameStateRef for validation inside peer callbacks, but here we use current state
-    // for local checks.
-    
     // 1. Identification Check
     if (isHost) {
         // I am Host.
         // If it's a manual click (forceSystemInput=false), ensure it is MY turn (Red).
-        if (!forceSystemInput && gameState.currentPlayer !== PlayerColor.RED) return;
-        
+        if (!forceSystemInput && gameState.currentPlayer !== PlayerColor.RED) {
+             console.log("Not host turn");
+             return;
+        }
         // If network request, ensure the requester matches the current player
-        // Note: The logic in peer.on('data') already checks requestingColor vs Ref, so this is a double check.
-        if (requestingColor && requestingColor !== gameState.currentPlayer) return;
+        if (requestingColor && requestingColor !== gameState.currentPlayer) {
+            console.log("Wrong requester color");
+            return;
+        }
     } else {
-        // I am Guest.
-        // Send request to Host.
+        // I am Guest. Send request to Host.
         if (gameState.currentPlayer === myColor && connectionRef.current?.open) {
             connectionRef.current.send({ type: 'ROLL' });
         }
-        return; // Client stops here
+        return; 
     }
 
     if (gameState.winner) return;
@@ -540,7 +482,6 @@ export default function App() {
 
     setTimeout(() => {
       const newValue = Math.floor(Math.random() * 6) + 1;
-      // const newValue = 6; // Debugging
       const newLog = [...gameState.gameLog.slice(-4), `${playerProfiles[gameState.currentPlayer].name} rolled a ${newValue}`];
 
       setGameState(prev => {
@@ -552,19 +493,14 @@ export default function App() {
         };
       });
 
-      // Note: We need to check moves against the NEW value.
-      // Since state update is async, we pass `newValue` directly to helper
       const canMove = hasValidMoves(gameState.currentPlayer, newValue, gameState.tokens);
 
       if (canMove) {
           setTurnStep('MOVE');
           setMoveTimer(15); 
       } else {
-          setTurnStep('MOVE'); 
+          setTurnStep('MOVE'); // Technically waiting for timeout to auto-pass
           setTimeout(() => {
-              // We need to pass the updated tokens (same as current in this case)
-              // But we need to be careful about state closure. 
-              // Using functional update in finishTurn is safer or passing current tokens.
               finishTurn(gameState.tokens, `No valid moves for ${playerProfiles[gameState.currentPlayer].name}.`, false);
           }, 1500); 
       }
@@ -598,7 +534,7 @@ export default function App() {
                   loops++;
               } while (!playerProfiles[order[nextIdx]].isActive && loops < 4);
               
-              if (loops >= 4) return prev;
+              if (loops >= 4) return prev; // Should not happen if game is running
               nextPlayer = order[nextIdx];
           }
 
@@ -613,7 +549,7 @@ export default function App() {
       });
       
       setTurnStep('ROLL');
-      setMoveTimer(15); 
+      setMoveTimer(15); // Force reset timer
   };
 
   const handleTokenClick = async (tokenId: string, forceSystemInput: boolean = false, requestingColor?: PlayerColor) => {
@@ -652,7 +588,7 @@ export default function App() {
         endPos = startPos + diceVal;
     }
 
-    // Animation loop
+    // Animation loop (simplified for state updates)
     if (startPos !== -1) {
         for (let i = startPos + 1; i <= endPos; i++) {
              setGameState(prev => ({
@@ -681,15 +617,7 @@ export default function App() {
         const isSafeSpot = SAFE_SPOTS.includes(globalIndex);
         
         if (!isSafeSpot) {
-            // Need current tokens to check collision
-            // We can rely on ref or just map current state in setter? 
-            // Better to grab latest from state updater to be safe, but complex logic here.
-            // We'll use gameStateRef.current.tokens BUT updated with current move. 
-            // Actually strictly speaking we should use the tokens from the last step of animation loop.
-            const currentTokens = gameStateRef.current.tokens; // This is theoretically 'live' if sync is fast, but animation loop sets state locally.
-            // Safer to just use the token list we are building.
-            
-            // Re-find opponent in the list we are about to commit
+            // Check collision against latest state tokens
             const opponentToken = gameStateRef.current.tokens.find(t => {
                if (t.color === token.color || t.position === -1 || t.position > 50) return false;
                const oppOffset = START_OFFSETS[t.color];
@@ -765,7 +693,9 @@ export default function App() {
   };
 
   const handleProfileUpdate = (color: PlayerColor, field: 'name' | 'flag', value: string) => {
-    if (color !== myColor) return;
+    if (color !== myColor && isHost === false) return; // Guests can only update self, checked via myColor
+    
+    // Host allows update if logic called from PeerJS which verified sender
     setPlayerProfiles(prev => {
         const newState = {
             ...prev,
@@ -783,14 +713,111 @@ export default function App() {
       if (!isHost) return;
       const connectionInfo = connectionsRef.current.find(c => c.color === color);
       if (connectionInfo) {
-          connectionInfo.conn.close();
+          connectionInfo.conn.send({ type: 'KICKED' });
+          setTimeout(() => connectionInfo.conn.close(), 100);
           connectionsRef.current = connectionsRef.current.filter(c => c.color !== color);
       }
 
       setPlayerProfiles(prev => ({
           ...prev,
-          [color]: { ...prev[color], isActive: false, isRemote: false, name: 'Empty' }
+          [color]: { ...prev[color], isActive: false, isRemote: false, name: 'Empty', flag: null }
       }));
+
+      // Remove player's tokens from the board
+      setGameState(prev => {
+          const newTokens = prev.tokens.filter(t => t.color !== color);
+          
+          let nextPlayer = prev.currentPlayer;
+          let diceValue = prev.diceValue;
+          let isRolling = prev.isRolling;
+          let turnStepVal = turnStep;
+          let timerVal = moveTimer;
+
+          // If it was the kicked player's turn, force move to next player
+          if (prev.currentPlayer === color) {
+              const order = [PlayerColor.BLUE, PlayerColor.RED, PlayerColor.GREEN, PlayerColor.YELLOW];
+              let nextIdx = order.indexOf(prev.currentPlayer);
+              let loops = 0;
+              // We need to look at FUTURE profiles (where kicked player is inactive)
+              // But setPlayerProfiles is async. We assume the kick makes them inactive.
+              // We search for the next Active player (skipping the one we just kicked)
+              
+              // Helper to find next active in current profiles, excluding 'color'
+              const findNext = (startIdx: number) => {
+                  let i = startIdx;
+                  let found = null;
+                  let attempt = 0;
+                  while(attempt < 4) {
+                      i = (i + 1) % 4;
+                      const c = order[i];
+                      const p = playerProfilesRef.current[c];
+                      // Active check: Use Ref for other players, but 'color' is definitely inactive now
+                      const isActive = (c !== color) && p.isActive;
+                      if (isActive) {
+                          found = c;
+                          break;
+                      }
+                      attempt++;
+                  }
+                  return found;
+              };
+
+              const foundNext = findNext(nextIdx);
+              if (foundNext) {
+                  nextPlayer = foundNext;
+                  diceValue = null;
+                  isRolling = false;
+                  turnStepVal = 'ROLL';
+                  timerVal = 15;
+              }
+          }
+
+          // Immediate Sync state with updated tokens and potentially new player
+          const newGS = {
+              ...prev,
+              tokens: newTokens,
+              currentPlayer: nextPlayer,
+              diceValue: diceValue,
+              isRolling: isRolling
+          };
+
+          // Broadcast explicitly because multiple states changed
+          setTimeout(() => {
+             setTurnStep(turnStepVal as any);
+             setMoveTimer(timerVal);
+             broadcastState({ gs: newGS, step: turnStepVal, timer: timerVal });
+          }, 50);
+
+          return newGS;
+      });
+  };
+
+  const handleAdmitNextPlayers = () => {
+      if (!isHost) return;
+      setMenuOpen(false);
+      
+      const activeColors = (Object.keys(playerProfiles) as PlayerColor[]).filter(c => playerProfiles[c].isActive);
+      const newTokens = INITIAL_TOKENS.filter(t => activeColors.includes(t.color));
+
+      const order = [PlayerColor.BLUE, PlayerColor.RED, PlayerColor.GREEN, PlayerColor.YELLOW];
+      const startingPlayer = order.find(c => playerProfiles[c].isActive) || PlayerColor.BLUE;
+      
+      const newGameState: GameState = {
+          ...gameState,
+          tokens: newTokens,
+          currentPlayer: startingPlayer,
+          diceValue: null,
+          isRolling: false,
+          isMoving: false,
+          gameLog: ["New Game Started!"],
+          winner: null,
+          status: 'PLAYING',
+          captureEvent: null,
+      };
+
+      setGameState(newGameState);
+      setMoveTimer(15);
+      setTurnStep('ROLL');
   };
 
   const getSelectableTokens = () => {
@@ -806,6 +833,16 @@ export default function App() {
 
   const selectableTokens = getSelectableTokens();
 
+  // --- Update Handlers Ref ---
+  // Ensure we always have fresh functions
+  useEffect(() => {
+      handlersRef.current = { 
+          handleRollDice, 
+          handleTokenClick, 
+          handleProfileUpdate 
+      };
+  });
+
   // --- Main Timer Logic (Host Only) ---
   useEffect(() => {
       if (!isHost) return;
@@ -818,8 +855,9 @@ export default function App() {
               }, 1000);
           } else {
               // Timer Reached 0 - Auto Turn
+              // Only trigger if we are strictly in a state that allows it
               if (turnStep === 'ROLL') {
-                  handleRollDice(true); // System auto-roll
+                  handleRollDice(true); 
               } else if (turnStep === 'MOVE') {
                   if (selectableTokens.length > 0) {
                       const bestToken = gameState.tokens
@@ -844,6 +882,21 @@ export default function App() {
               <p className="text-slate-400 max-w-md text-lg">
                   The game has already started or the lobby is full. Please wait for the next game.
               </p>
+          </div>
+      );
+  }
+
+  if (joinStatus === 'KICKED') {
+      return (
+          <div className="min-h-screen bg-slate-900 flex flex-col items-center justify-center p-6 text-center">
+              <Ban size={64} className="text-red-500 mb-6" />
+              <h1 className="text-3xl font-black text-white mb-2">You were removed</h1>
+              <p className="text-slate-400 max-w-md text-lg">
+                  The host has removed you from the game.
+              </p>
+              <button onClick={() => window.location.reload()} className="mt-6 bg-slate-800 hover:bg-slate-700 text-white px-4 py-2 rounded">
+                  Back to Lobby
+              </button>
           </div>
       );
   }
